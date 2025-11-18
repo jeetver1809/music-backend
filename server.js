@@ -2,45 +2,82 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const play = require('play-dl'); // ✅ NEW: The robust streaming library
+const { Innertube, UniversalCache } = require('youtubei.js'); // ✅ NEW: The anti-block library
 const ytsr = require('ytsr'); 
+const axios = require('axios'); // To pipe the stream
 
 const app = express();
 app.use(cors());
 
 app.get('/', (req, res) => res.send('Music Jam Server Online! 🚀'));
 
-// --- 1. PROXY STREAMING (Using play-dl) ---
+// --- GLOBAL YOUTUBE SESSION ---
+let yt = null;
+
+async function initYouTube() {
+    try {
+        yt = await Innertube.create({
+            cache: new UniversalCache(false),
+            generate_session_locally: true // This mimics a real Android device
+        });
+        console.log("✅ YouTube InnerTube Initialized!");
+    } catch (e) {
+        console.error("❌ Failed to init YouTube:", e);
+    }
+}
+initYouTube();
+
+// --- 1. ROBUST STREAMING ENDPOINT ---
 app.get('/stream', async (req, res) => {
     const videoUrl = req.query.url;
     if (!videoUrl) return res.status(400).send('No URL provided');
+    
+    // Extract Video ID from URL
+    const videoId = videoUrl.split('v=')[1];
+    if (!videoId) return res.status(400).send('Invalid Video ID');
 
-    console.log(`🔄 Streaming: ${videoUrl}`);
+    console.log(`🔄 Streaming ID: ${videoId}`);
 
     try {
-        // play-dl handles the complex signature deciphering automatically
-        const stream = await play.stream(videoUrl, {
-            discordPlayerCompatibility: false, // We are not using Discord
-            quality: 0 // Low/efficient quality
+        if (!yt) await initYouTube();
+
+        // 1. Get Info using Android Client
+        const info = await yt.getInfo(videoId);
+        
+        // 2. Find best audio format (m4a)
+        const format = info.chooseFormat({ type: 'audio', quality: 'best' });
+
+        if (!format || !format.url) {
+            return res.status(500).send('No audio format found');
+        }
+
+        // 3. Proxy the stream
+        // We use axios to fetch the raw Google stream and pipe it to the phone
+        // This keeps the IP connection between Server <-> Google, not Phone <-> Google
+        const response = await axios({
+            method: 'get',
+            url: format.url,
+            responseType: 'stream',
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
         });
 
-        // Set headers so the phone knows it's audio
-        res.setHeader('Content-Type', 'audio/mp4'); 
+        // Set Headers for the phone
+        res.setHeader('Content-Type', 'audio/mp4');
         res.setHeader('Transfer-Encoding', 'chunked');
 
-        // Pipe the clean stream to the phone
-        stream.stream.pipe(res);
+        // Pipe data
+        response.data.pipe(res);
 
-        stream.stream.on('error', (err) => {
-            console.error('Stream Error:', err.message);
-            if (!res.headersSent) res.status(500).send('Stream failed');
+        response.data.on('error', (err) => {
+             console.error('Stream Interrupted:', err.message);
+             res.end();
         });
 
     } catch (e) {
         console.error('Proxy Error:', e.message);
-        if (!res.headersSent) {
-             res.status(500).send(`Server Error: ${e.message}`);
-        }
+        if (!res.headersSent) res.status(500).send(`Server Error: ${e.message}`);
     }
 });
 
@@ -130,8 +167,6 @@ io.on('connection', (socket) => {
 
   socket.on('search_query', async (query) => {
     try {
-      // play-dl has a built-in search too, we can use it or stick to ytsr
-      // sticking to ytsr as it is very reliable for metadata
       const searchResults = await ytsr(query, { limit: 10 });
       const results = searchResults.items
         .filter(item => item.type === 'video')
