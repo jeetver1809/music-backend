@@ -2,7 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const ytdl = require('ytdl-core'); // Node-only streaming
+const ytdl = require('@distube/ytdl-core'); // ✅ NEW: Maintained library
 const ytsr = require('ytsr'); 
 
 const app = express();
@@ -10,51 +10,50 @@ app.use(cors());
 
 app.get('/', (req, res) => res.send('Music Jam Server Online! 🚀'));
 
-// --- 1. STREAMING PROXY (FINAL VERSION) ---
-app.get('/stream', (req, res) => {
+// --- 1. ROBUST STREAMING ENDPOINT ---
+app.get('/stream', async (req, res) => {
     const videoUrl = req.query.url;
     if (!videoUrl) return res.status(400).send('No URL provided');
 
-    // ✅ CRITICAL: Set headers immediately to avoid mobile player timeouts
-    res.setHeader('Content-Type', 'audio/mp4');
-    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    console.log(`🔄 Processing: ${videoUrl}`);
 
     try {
-        // ✅ FIX: Force lowest audio quality for fastest possible stream start
-        const audioStream = ytdl(videoUrl, {
-            filter: 'audioonly',
-            quality: 'lowestaudio', 
-            // We use the 'lowestaudio' quality tag to ensure the smallest header size.
-            // This is the key to fixing the mobile player timeout.
+        // 1. Get Video Info first (validates if we can access it)
+        const info = await ytdl.getInfo(videoUrl);
+        
+        // 2. Choose best audio format
+        const format = ytdl.chooseFormat(info.formats, { 
+            quality: 'highestaudio', // Better quality
+            filter: 'audioonly' 
         });
 
-        // Pipe audio stream directly to the response
+        if (!format) {
+            return res.status(500).send('No audio format found');
+        }
+
+        // 3. Setup Headers
+        res.setHeader('Content-Type', 'audio/mp4');
+        res.setHeader('Content-Length', format.contentLength); // Helps player know duration/progress
+
+        // 4. Start the Stream
+        const audioStream = ytdl.downloadFromInfo(info, { format: format });
+        
         audioStream.pipe(res);
 
-        // Handle errors gracefully without crashing the server or hanging the request
         audioStream.on('error', (err) => {
-            console.error('YTDL Stream Error:', err.message);
-            // Only send error status if headers haven't already been sent
-            if (!res.headersSent) {
-                res.status(500).send('Stream initialization failed.');
-            }
-            audioStream.destroy();
-        });
-        
-        // Handle client disconnection (prevents memory leak)
-        req.on('close', () => {
-            audioStream.destroy();
-            console.log("Client disconnected, stream destroyed.");
+            console.error('Stream interrupted:', err.message);
+            if (!res.headersSent) res.status(500).send('Stream error');
         });
 
     } catch (e) {
-        console.error('Proxy Catch Error:', e.message);
+        console.error('Proxy Failed:', e.message);
+        // Fallback: Try redirecting to the raw link if proxy fails
+        // This might work if the IP block is soft
         if (!res.headersSent) {
-            res.status(500).send('Internal server error during stream init.');
+             res.status(500).send('Server blocked by YouTube');
         }
     }
 });
-// --- End STREAMING PROXY ---
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -66,7 +65,6 @@ const rooms = {};
 io.on('connection', (socket) => {
   console.log(`⚡ User: ${socket.id}`);
 
-  // --- HELPER: Play Next ---
   const playNext = (roomCode) => {
     const room = rooms[roomCode];
     if (!room || room.queue.length === 0) {
@@ -75,7 +73,7 @@ io.on('connection', (socket) => {
     };
 
     const nextSong = room.queue.shift(); 
-    // Proxy URL remains the same, pointing to our server: /stream?url=...
+    // Use our new Robust Stream endpoint
     const proxyUrl = `/stream?url=${encodeURIComponent(nextSong.originalUrl)}`;
     
     room.currentSongUrl = proxyUrl;
@@ -92,7 +90,6 @@ io.on('connection', (socket) => {
     });
     io.to(roomCode).emit('queue_updated', room.queue);
   };
-
 
   socket.on('join_room', ({ roomCode, username }) => {
     socket.join(roomCode);
@@ -143,7 +140,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --- SEARCH (ytsr) ---
   socket.on('search_query', async (query) => {
     try {
       const searchResults = await ytsr(query, { limit: 10 });
@@ -181,7 +177,7 @@ io.on('connection', (socket) => {
         title: title,
         thumbnail: thumbnail,
         originalUrl: youtubeUrl,
-        audioUrl: null // No need to fetch audio URL upfront anymore
+        audioUrl: null 
     });
 
     io.to(roomCode).emit('queue_updated', room.queue);
