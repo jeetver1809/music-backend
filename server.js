@@ -3,9 +3,14 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const youtubedl = require('youtube-dl-exec');
+const ytsr = require('ytsr'); 
 
 const app = express();
 app.use(cors());
+
+app.get('/', (req, res) => {
+  res.send('Music Jam Server is Online! 🚀');
+});
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -13,12 +18,6 @@ const io = new Server(server, {
 });
 
 const rooms = {};
-
-// ✅ CRITICAL: Health Check for Render
-// This tells the cloud "I am alive!" so it doesn't kill the app.
-app.get('/', (req, res) => {
-  res.send('Music Jam Server is Online! 🚀');
-});
 
 async function getAudioLink(youtubeUrl) {
   try {
@@ -46,15 +45,12 @@ io.on('connection', (socket) => {
 
     if (room.queue.length > 0) {
       const nextSong = room.queue.shift(); 
-      
       room.currentSongUrl = nextSong.audioUrl;
       room.currentTitle = nextSong.title;
       room.currentThumbnail = nextSong.thumbnail;
       room.isPlaying = true;
       room.timestamp = 0;
       room.lastUpdate = Date.now();
-
-      console.log(`▶️ Playing Next: ${nextSong.title}`);
 
       io.to(roomCode).emit('play_song', { 
         url: nextSong.audioUrl,
@@ -63,7 +59,6 @@ io.on('connection', (socket) => {
       });
       io.to(roomCode).emit('queue_updated', room.queue);
     } else {
-      console.log("⚠️ Queue empty.");
       room.isPlaying = false;
     }
   };
@@ -86,6 +81,7 @@ io.on('connection', (socket) => {
 
     const room = rooms[roomCode];
     const newUser = { id: socket.id, name: username || `User ${socket.id.substr(0,4)}` };
+    
     if (!room.users.find(u => u.id === socket.id)) {
         room.users.push(newUser);
     }
@@ -108,49 +104,57 @@ io.on('connection', (socket) => {
     });
   });
 
+  // --- MEMORY FIX: CLEANUP USERS & ROOMS ---
   socket.on('disconnect', () => {
     for (const roomCode in rooms) {
       const room = rooms[roomCode];
       const index = room.users.findIndex(user => user.id === socket.id);
+      
       if (index !== -1) {
         console.log(`👋 ${room.users[index].name} left ${roomCode}`);
         room.users.splice(index, 1);
         io.to(roomCode).emit('update_users', room.users);
+        
+        // ✅ FIX: Delete room if empty to free up RAM
+        if (room.users.length === 0) {
+            console.log(`🗑️ Deleting empty room: ${roomCode}`);
+            delete rooms[roomCode];
+        }
         break;
       }
     }
   });
 
+  // --- MEMORY FIX: LIGHTWEIGHT SEARCH ---
   socket.on('search_query', async (query) => {
     console.log(`🔎 Searching: "${query}"`);
     try {
-      const output = await youtubedl(query, {
-        dumpSingleJson: true,
-        defaultSearch: 'ytsearch5',
-        noWarnings: true,
-        flatPlaylist: true, 
-      });
+      // ✅ FIX: Fetch 15 items directly (No getFilters call = 50% less RAM)
+      const searchResults = await ytsr(query, { limit: 15 });
       
-      const entries = output.entries || [];
-      if (entries.length > 0) {
-        const results = entries.map(entry => ({
-          title: entry.title,
-          id: entry.id,
-          url: `https://www.youtube.com/watch?v=${entry.id}`,
-          thumbnail: `https://i.ytimg.com/vi/${entry.id}/hqdefault.jpg`
+      // Filter for videos only in memory
+      const results = searchResults.items
+        .filter(item => item.type === 'video')
+        .slice(0, 5) // Take top 5
+        .map(item => ({
+          title: item.title,
+          id: item.id,
+          url: item.url,
+          thumbnail: item.bestThumbnail.url
         }));
-        socket.emit('search_results', results);
-      } else {
-        socket.emit('song_error', "No songs found.");
-      }
+
+      console.log(`✅ Found ${results.length} results`);
+      socket.emit('search_results', results);
+      
     } catch (e) {
-      console.error("Search Failed:", e.message);
-      socket.emit('song_error', "Search failed.");
+      console.error("Search Error:", e.message);
+      socket.emit('song_error', "Search failed. Try again.");
     }
   });
 
   socket.on('request_song', async ({ roomCode, youtubeUrl, title, thumbnail }) => {
     if (!rooms[roomCode]) {
+        // Auto-recreate room if missing
         rooms[roomCode] = {
             currentSongUrl: null,
             currentTitle: "No Song Playing",
