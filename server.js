@@ -2,15 +2,43 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const youtubedl = require('youtube-dl-exec');
+const { spawn } = require('child_process');
 const ytsr = require('ytsr'); 
 
 const app = express();
 app.use(cors());
 
-app.get('/', (req, res) => {
-  res.send('Music Jam Server is Online! 🚀');
+// --- 1. STREAMING PROXY (The Magic Fix) ---
+app.get('/stream', (req, res) => {
+  const videoUrl = req.query.url;
+  if (!videoUrl) return res.status(400).send('No URL provided');
+
+  console.log(`🔄 Proxying: ${videoUrl}`);
+  
+  // Tell the browser/phone this is an audio file
+  res.setHeader('Content-Type', 'audio/mp4');
+
+  // Use yt-dlp to stream data directly to the response
+  // This bypasses the IP check because Render does the downloading
+  const ytDlp = spawn('npx', [
+      'yt-dlp',
+      '-f', 'bestaudio[ext=m4a]',
+      '-o', '-', // Output to stdout (pipe)
+      '-q',      // Quiet mode (no logs in audio stream)
+      '--no-warnings',
+      videoUrl
+  ]);
+
+  // Pipe audio -> Phone
+  ytDlp.stdout.pipe(res);
+
+  // Cleanup if phone disconnects
+  req.on('close', () => {
+      ytDlp.kill();
+  });
 });
+
+app.get('/', (req, res) => res.send('Music Jam Server Online!'));
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -19,53 +47,38 @@ const io = new Server(server, {
 
 const rooms = {};
 
-async function getAudioLink(youtubeUrl) {
-  try {
-    console.log(`🎧 Fetching link for: ${youtubeUrl}`);
-    const output = await youtubedl(youtubeUrl, {
-      getUrl: true,
-      format: 'bestaudio[ext=m4a]',
-      noCheckCertificates: true,
-      noWarnings: true,
-      preferFreeFormats: true,
-    });
-    return output.trim();
-  } catch (err) {
-    console.error("❌ Link Fetch Error:", err.message);
-    return null;
-  }
-}
-
 io.on('connection', (socket) => {
-  console.log(`⚡ User Connected: ${socket.id}`);
+  console.log(`⚡ User: ${socket.id}`);
 
   const playNext = (roomCode) => {
     const room = rooms[roomCode];
-    if (!room) return;
+    if (!room || room.queue.length === 0) {
+        if(room) room.isPlaying = false;
+        return;
+    };
 
-    if (room.queue.length > 0) {
-      const nextSong = room.queue.shift(); 
-      room.currentSongUrl = nextSong.audioUrl;
-      room.currentTitle = nextSong.title;
-      room.currentThumbnail = nextSong.thumbnail;
-      room.isPlaying = true;
-      room.timestamp = 0;
-      room.lastUpdate = Date.now();
+    const nextSong = room.queue.shift(); 
+    // Point to OUR server, not YouTube
+    // We send a relative path "/stream?url=..."
+    const proxyUrl = `/stream?url=${encodeURIComponent(nextSong.originalUrl)}`;
+    
+    room.currentSongUrl = proxyUrl;
+    room.currentTitle = nextSong.title;
+    room.currentThumbnail = nextSong.thumbnail;
+    room.isPlaying = true;
+    room.timestamp = 0;
+    room.lastUpdate = Date.now();
 
-      io.to(roomCode).emit('play_song', { 
-        url: nextSong.audioUrl,
-        title: nextSong.title,
-        thumbnail: nextSong.thumbnail
-      });
-      io.to(roomCode).emit('queue_updated', room.queue);
-    } else {
-      room.isPlaying = false;
-    }
+    io.to(roomCode).emit('play_song', { 
+      url: proxyUrl,
+      title: nextSong.title,
+      thumbnail: nextSong.thumbnail
+    });
+    io.to(roomCode).emit('queue_updated', room.queue);
   };
 
   socket.on('join_room', ({ roomCode, username }) => {
     socket.join(roomCode);
-    
     if (!rooms[roomCode]) {
       rooms[roomCode] = {
         currentSongUrl: null,
@@ -78,16 +91,13 @@ io.on('connection', (socket) => {
         lastUpdate: Date.now()
       };
     }
-
     const room = rooms[roomCode];
     const newUser = { id: socket.id, name: username || `User ${socket.id.substr(0,4)}` };
-    
-    if (!room.users.find(u => u.id === socket.id)) {
-        room.users.push(newUser);
-    }
+    if (!room.users.find(u => u.id === socket.id)) room.users.push(newUser);
 
     io.to(roomCode).emit('update_users', room.users);
 
+    // Calculate time drift
     let adjustedTime = room.timestamp;
     if (room.isPlaying) {
       const timeDiff = (Date.now() - room.lastUpdate) / 1000;
@@ -104,95 +114,56 @@ io.on('connection', (socket) => {
     });
   });
 
-  // --- MEMORY FIX: CLEANUP USERS & ROOMS ---
   socket.on('disconnect', () => {
     for (const roomCode in rooms) {
       const room = rooms[roomCode];
       const index = room.users.findIndex(user => user.id === socket.id);
-      
       if (index !== -1) {
-        console.log(`👋 ${room.users[index].name} left ${roomCode}`);
         room.users.splice(index, 1);
         io.to(roomCode).emit('update_users', room.users);
-        
-        // ✅ FIX: Delete room if empty to free up RAM
-        if (room.users.length === 0) {
-            console.log(`🗑️ Deleting empty room: ${roomCode}`);
-            delete rooms[roomCode];
-        }
+        if (room.users.length === 0) delete rooms[roomCode]; // Cleanup empty room
         break;
       }
     }
   });
 
-  // --- MEMORY FIX: LIGHTWEIGHT SEARCH ---
   socket.on('search_query', async (query) => {
-    console.log(`🔎 Searching: "${query}"`);
     try {
-      // ✅ FIX: Fetch 15 items directly (No getFilters call = 50% less RAM)
-      const searchResults = await ytsr(query, { limit: 15 });
-      
-      // Filter for videos only in memory
+      const searchResults = await ytsr(query, { limit: 10 });
       const results = searchResults.items
         .filter(item => item.type === 'video')
-        .slice(0, 5) // Take top 5
+        .slice(0, 5)
         .map(item => ({
           title: item.title,
           id: item.id,
           url: item.url,
           thumbnail: item.bestThumbnail.url
         }));
-
-      console.log(`✅ Found ${results.length} results`);
       socket.emit('search_results', results);
-      
     } catch (e) {
-      console.error("Search Error:", e.message);
-      socket.emit('song_error', "Search failed. Try again.");
+      socket.emit('song_error', "Search failed.");
     }
   });
 
   socket.on('request_song', async ({ roomCode, youtubeUrl, title, thumbnail }) => {
-    if (!rooms[roomCode]) {
-        // Auto-recreate room if missing
-        rooms[roomCode] = {
-            currentSongUrl: null,
-            currentTitle: "No Song Playing",
-            currentThumbnail: null,
-            queue: [],
-            users: [],
-            isPlaying: false,
-            timestamp: 0,
-            lastUpdate: Date.now()
-        };
-    }
-
-    const streamUrl = await getAudioLink(youtubeUrl);
+    if (!rooms[roomCode]) return; // Should handle recreation but keeping simple
     
-    if (streamUrl && streamUrl.startsWith('http')) {
-      const room = rooms[roomCode];
-      room.queue.push({
-          title: title || "Unknown Track",
-          thumbnail: thumbnail || "",
-          audioUrl: streamUrl,
-          originalUrl: youtubeUrl
-      });
-      io.to(roomCode).emit('queue_updated', room.queue);
+    const room = rooms[roomCode];
+    room.queue.push({
+        title: title,
+        thumbnail: thumbnail,
+        originalUrl: youtubeUrl,
+        audioUrl: null // Will be generated when played
+    });
 
-      if (!room.isPlaying && !room.currentSongUrl) {
-          playNext(roomCode);
-      }
-    } else {
-      socket.emit('song_error', 'Could not load song.');
+    io.to(roomCode).emit('queue_updated', room.queue);
+
+    if (!room.isPlaying) {
+        playNext(roomCode);
     }
   });
 
-  socket.on('skip_track', (roomCode) => {
-      const room = rooms[roomCode];
-      if (room && room.queue.length > 0) {
-         playNext(roomCode);
-      }
-  });
+  socket.on('skip_track', (roomCode) => playNext(roomCode));
 
   socket.on('pause_track', ({ roomCode, timestamp }) => {
     if (rooms[roomCode]) {
@@ -222,6 +193,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => {
-  console.log(`🚀 SERVER RUNNING ON PORT ${PORT}`);
-});
+server.listen(PORT, () => console.log(`🚀 Server running on ${PORT}`));
