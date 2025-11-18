@@ -14,6 +14,7 @@ const io = new Server(server, {
 
 const rooms = {};
 
+// --- HELPER: Get Direct Audio Link ---
 async function getAudioLink(youtubeUrl) {
   try {
     console.log(`🎧 Fetching link for: ${youtubeUrl}`);
@@ -63,6 +64,7 @@ io.on('connection', (socket) => {
     }
   };
 
+  // --- JOIN ROOM ---
   socket.on('join_room', ({ roomCode, username }) => {
     socket.join(roomCode);
     
@@ -81,15 +83,15 @@ io.on('connection', (socket) => {
 
     const room = rooms[roomCode];
     
-    // Add User
+    // Add User to List (Avoid duplicates)
     const newUser = { id: socket.id, name: username || `User ${socket.id.substr(0,4)}` };
-    // Avoid duplicates
     if (!room.users.find(u => u.id === socket.id)) {
         room.users.push(newUser);
     }
 
     io.to(roomCode).emit('update_users', room.users);
 
+    // Calculate Drift
     let adjustedTime = room.timestamp;
     if (room.isPlaying) {
       const timeDiff = (Date.now() - room.lastUpdate) / 1000;
@@ -106,11 +108,13 @@ io.on('connection', (socket) => {
     });
   });
 
+  // --- DISCONNECT ---
   socket.on('disconnect', () => {
     for (const roomCode in rooms) {
       const room = rooms[roomCode];
       const index = room.users.findIndex(user => user.id === socket.id);
       if (index !== -1) {
+        console.log(`👋 ${room.users[index].name} left ${roomCode}`);
         room.users.splice(index, 1);
         io.to(roomCode).emit('update_users', room.users);
         break;
@@ -118,6 +122,7 @@ io.on('connection', (socket) => {
     }
   });
 
+  // --- SEARCH ---
   socket.on('search_query', async (query) => {
     console.log(`🔎 Searching: "${query}"`);
     try {
@@ -146,10 +151,11 @@ io.on('connection', (socket) => {
     }
   });
 
+  // --- REQUEST SONG ---
   socket.on('request_song', async ({ roomCode, youtubeUrl, title, thumbnail }) => {
-    // --- CRASH FIX: Check if room exists, if not, recreate it ---
+    // ✅ CRASH FIX: If server restarted, recreate the room instantly
     if (!rooms[roomCode]) {
-        console.log(`⚠️ Room ${roomCode} not found (server restarted?). Re-creating...`);
+        console.log(`⚠️ Room ${roomCode} missing. Auto-creating...`);
         rooms[roomCode] = {
             currentSongUrl: null,
             currentTitle: "No Song Playing",
@@ -176,7 +182,7 @@ io.on('connection', (socket) => {
 
       io.to(roomCode).emit('queue_updated', room.queue);
 
-      // Play immediately if idle
+      // Auto-play if idle
       if (!room.isPlaying && !room.currentSongUrl) {
           playNext(roomCode);
       }
@@ -185,9 +191,9 @@ io.on('connection', (socket) => {
     }
   });
 
+  // --- CONTROLS ---
   socket.on('skip_track', (roomCode) => {
       const room = rooms[roomCode];
-      // Safety check
       if (room && room.queue.length > 0) {
          playNext(roomCode);
       }
@@ -220,6 +226,9 @@ io.on('connection', (socket) => {
   });
 });
 
-server.listen(3001, () => {
-  console.log('🚀 SERVER RUNNING ON PORT 3001');
+// Uses the port provided by Render/Railway, or 3001 if running locally
+const PORT = process.env.PORT || 3001;
+
+server.listen(PORT, () => {
+  console.log(`🚀 SERVER RUNNING ON PORT ${PORT}`);
 });
