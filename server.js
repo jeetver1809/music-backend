@@ -2,64 +2,42 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const ytdl = require('@distube/ytdl-core');
+const play = require('play-dl'); // ✅ NEW: The robust streaming library
 const ytsr = require('ytsr'); 
 
 const app = express();
-
-// Allow CORS for everything
-app.use(cors({ origin: "*" }));
+app.use(cors());
 
 app.get('/', (req, res) => res.send('Music Jam Server Online! 🚀'));
 
-// --- ROBUST STREAMING ENDPOINT ---
+// --- 1. PROXY STREAMING (Using play-dl) ---
 app.get('/stream', async (req, res) => {
     const videoUrl = req.query.url;
     if (!videoUrl) return res.status(400).send('No URL provided');
 
-    console.log(`🔄 Processing: ${videoUrl}`);
+    console.log(`🔄 Streaming: ${videoUrl}`);
 
     try {
-        // 1. Manual CORS Headers (Fixes OpaqueResponseBlocking)
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Content-Type', 'audio/mp4');
-
-        // 2. Get Video Info with Mobile User Agent
-        // "ANDROID" client is less likely to be throttled on cloud servers
-        const agent = ytdl.createAgent([{ name: "cookie", value: "" }]); 
-        
-        const info = await ytdl.getInfo(videoUrl, { 
-            agent,
-            playerClients: ["ANDROID", "WEB"] 
-        });
-        
-        // 3. Choose best audio format
-        const format = ytdl.chooseFormat(info.formats, { 
-            quality: 'highestaudio',
-            filter: 'audioonly' 
+        // play-dl handles the complex signature deciphering automatically
+        const stream = await play.stream(videoUrl, {
+            discordPlayerCompatibility: false, // We are not using Discord
+            quality: 0 // Low/efficient quality
         });
 
-        if (!format) {
-            return res.status(500).send('No audio format found');
-        }
+        // Set headers so the phone knows it's audio
+        res.setHeader('Content-Type', 'audio/mp4'); 
+        res.setHeader('Transfer-Encoding', 'chunked');
 
-        console.log(`🎵 Streaming format: ${format.container} / ${format.hasAudio ? 'Audio OK' : 'No Audio'}`);
+        // Pipe the clean stream to the phone
+        stream.stream.pipe(res);
 
-        // 4. Start the Stream
-        const audioStream = ytdl.downloadFromInfo(info, { 
-            format: format,
-            dlChunkSize: 0, // Disable chunking for smoother http piping
-        });
-        
-        audioStream.pipe(res);
-
-        audioStream.on('error', (err) => {
-            console.error('Stream interrupted:', err.message);
-            if (!res.headersSent) res.status(500).send('Stream error');
+        stream.stream.on('error', (err) => {
+            console.error('Stream Error:', err.message);
+            if (!res.headersSent) res.status(500).send('Stream failed');
         });
 
     } catch (e) {
-        console.error('Proxy Failed:', e.message);
+        console.error('Proxy Error:', e.message);
         if (!res.headersSent) {
              res.status(500).send(`Server Error: ${e.message}`);
         }
@@ -152,6 +130,8 @@ io.on('connection', (socket) => {
 
   socket.on('search_query', async (query) => {
     try {
+      // play-dl has a built-in search too, we can use it or stick to ytsr
+      // sticking to ytsr as it is very reliable for metadata
       const searchResults = await ytsr(query, { limit: 10 });
       const results = searchResults.items
         .filter(item => item.type === 'video')

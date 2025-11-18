@@ -9,8 +9,8 @@
     "cors": "^2.8.5",
     "express": "^4.18.2",
     "socket.io": "^4.7.2",
-    "@distube/ytdl-core": "^4.16.0",
-    "ytsr": "^3.8.0"
+    "play-dl": "^1.9.7",
+    "ytsr": "^3.8.0" 
   },
   "engines": {
     "node": ">=18.0.0"
