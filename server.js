@@ -2,58 +2,67 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const ytdl = require('@distube/ytdl-core'); // ✅ Using the library directly
+const ytdl = require('@distube/ytdl-core');
 const ytsr = require('ytsr'); 
 
 const app = express();
-app.use(cors());
+
+// Allow CORS for everything
+app.use(cors({ origin: "*" }));
 
 app.get('/', (req, res) => res.send('Music Jam Server Online! 🚀'));
 
-// --- 1. ROBUST STREAMING ENDPOINT (Node.js Native) ---
+// --- ROBUST STREAMING ENDPOINT ---
 app.get('/stream', async (req, res) => {
     const videoUrl = req.query.url;
     if (!videoUrl) return res.status(400).send('No URL provided');
 
-    console.log(`🔄 Streaming: ${videoUrl}`);
+    console.log(`🔄 Processing: ${videoUrl}`);
 
     try {
-        // 1. Configure Headers
-        // These prevent the "OpaqueResponseBlocking" error
+        // 1. Manual CORS Headers (Fixes OpaqueResponseBlocking)
+        res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Content-Type', 'audio/mp4');
-        res.setHeader('Transfer-Encoding', 'chunked');
 
-        // 2. Create Stream using @distube/ytdl-core
-        // 'ipv6Block' is sometimes needed for cloud servers, but we try default first
-        const audioStream = ytdl(videoUrl, {
-            quality: 'lowestaudio', // Lowest quality = Fastest load time
-            filter: 'audioonly',
-            liveBuffer: 0,          // Reduce latency
-            highWaterMark: 1 << 25, // Large buffer to prevent cutting out
-            dlChunkSize: 0,         // Disable chunking for smoother stream
+        // 2. Get Video Info with Mobile User Agent
+        // "ANDROID" client is less likely to be throttled on cloud servers
+        const agent = ytdl.createAgent([{ name: "cookie", value: "" }]); 
+        
+        const info = await ytdl.getInfo(videoUrl, { 
+            agent,
+            playerClients: ["ANDROID", "WEB"] 
+        });
+        
+        // 3. Choose best audio format
+        const format = ytdl.chooseFormat(info.formats, { 
+            quality: 'highestaudio',
+            filter: 'audioonly' 
         });
 
-        // 3. Pipe data to phone
+        if (!format) {
+            return res.status(500).send('No audio format found');
+        }
+
+        console.log(`🎵 Streaming format: ${format.container} / ${format.hasAudio ? 'Audio OK' : 'No Audio'}`);
+
+        // 4. Start the Stream
+        const audioStream = ytdl.downloadFromInfo(info, { 
+            format: format,
+            dlChunkSize: 0, // Disable chunking for smoother http piping
+        });
+        
         audioStream.pipe(res);
 
-        // 4. Handle Stream Errors (Prevents server crash)
         audioStream.on('error', (err) => {
-            console.error('Stream Error:', err.message);
-            if (!res.headersSent) {
-                res.status(500).send('Stream failed');
-            } else {
-                res.end();
-            }
-        });
-
-        // 5. Cleanup
-        req.on('close', () => {
-            audioStream.destroy();
+            console.error('Stream interrupted:', err.message);
+            if (!res.headersSent) res.status(500).send('Stream error');
         });
 
     } catch (e) {
-        console.error('Proxy Setup Error:', e.message);
-        if (!res.headersSent) res.status(500).send('Internal Server Error');
+        console.error('Proxy Failed:', e.message);
+        if (!res.headersSent) {
+             res.status(500).send(`Server Error: ${e.message}`);
+        }
     }
 });
 
@@ -75,8 +84,6 @@ io.on('connection', (socket) => {
     };
 
     const nextSong = room.queue.shift(); 
-    
-    // Generate the proxy URL
     const proxyUrl = `/stream?url=${encodeURIComponent(nextSong.originalUrl)}`;
     
     room.currentSongUrl = proxyUrl;
