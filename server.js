@@ -1,15 +1,28 @@
-// server.js
+// server.js (full file)
+// Music Jam server with caching, rate-limiting, Range-aware streaming, and validated queueing.
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const cors = require('cors');
 const { Innertube, UniversalCache } = require('youtubei.js');
 const ytsr = require('ytsr');
 const axios = require('axios');
 
 const app = express();
-app.use(cors());
 app.use(express.json());
+
+// ------------------ CORS (explicit, exposes streaming headers) ------------------
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*'); // allow all origins
+  res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range, Accept, Accept-Encoding');
+  // Expose these headers so the browser can read them
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Accept-Ranges, Content-Encoding, Content-Length, ETag, Cache-Control');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+  next();
+});
 
 app.get('/', (req, res) => res.send('Music Jam Server Online! 🚀'));
 
@@ -29,7 +42,8 @@ async function initYouTube() {
 initYouTube();
 
 // ------------------ Utilities ------------------
-// Extract a YouTube video ID from various url forms or accept an ID
+
+// Extracts a YouTube video ID from common URL forms or accepts an ID directly.
 function extractVideoId(urlOrId) {
   if (!urlOrId) return null;
   if (/^[0-9A-Za-z_-]{11}$/.test(urlOrId)) return urlOrId;
@@ -47,7 +61,7 @@ function extractVideoId(urlOrId) {
 
 // IP token-bucket limiter for /stream
 const RATE_CAPACITY = 30; // tokens per window
-const RATE_WINDOW_MS = 60 * 1000; // window size in ms (60s)
+const RATE_WINDOW_MS = 60 * 1000; // 60s
 const TOKEN_REFILL_PER_MS = RATE_CAPACITY / RATE_WINDOW_MS;
 const ipBuckets = new Map(); // ip -> { tokens, last }
 
@@ -201,8 +215,7 @@ async function getFormatWithCache(urlOrId) {
   throw new Error('No usable audio or muxed format URL found for video (maybe restricted or removed)');
 }
 
-// ------------------ /stream endpoint ------------------
-
+// ------------------ Range-aware /stream endpoint ------------------
 app.get('/stream', async (req, res) => {
   const videoUrl = req.query.url;
   if (!videoUrl) return res.status(400).send('No URL provided');
@@ -215,84 +228,69 @@ app.get('/stream', async (req, res) => {
 
   console.log(`🔄 Stream requested: ${videoUrl} from ${clientIp}`);
 
-  const attemptStream = async () => {
+  try {
+    // Resolve actual format URL first (re-uses getFormatWithCache)
     const { url: formatUrl, mimeType } = await getFormatWithCache(videoUrl);
     if (!formatUrl) throw new Error('No format URL resolved');
 
-    try {
-      // HEAD check (optional)
-      try {
-        await axios.head(formatUrl, {
-          headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.youtube.com/' },
-          timeout: 8000
-        });
-      } catch (hdrErr) {
-        // Sometimes HEAD fails; continue to GET
-        console.warn('HEAD check warning for format URL:', hdrErr && hdrErr.message ? hdrErr.message : hdrErr);
+    // Build headers to forward to upstream; include Range if client asked for it
+    const forwardHeaders = {
+      'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0',
+      'Referer': 'https://www.youtube.com/',
+      'Accept': '*/*'
+    };
+    if (req.headers.range) forwardHeaders.Range = req.headers.range;
+
+    // Make upstream request (stream)
+    const upstream = await axios({
+      method: 'get',
+      url: formatUrl,
+      responseType: 'stream',
+      headers: forwardHeaders,
+      timeout: 20000,
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity,
+      validateStatus: status => (status >= 200 && status < 400) // allow 206
+    });
+
+    // Mirror the important headers/status from upstream to the client
+    const headerWhitelist = ['content-range','accept-ranges','content-length','content-type','etag','cache-control'];
+    // set status (use upstream status so 206 Partial Content is preserved)
+    res.status(upstream.status);
+    // copy safe headers
+    for (const h of headerWhitelist) {
+      if (upstream.headers[h]) {
+        res.setHeader(h, upstream.headers[h]);
       }
-
-      const resp = await axios({
-        method: 'get',
-        url: formatUrl,
-        responseType: 'stream',
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-          'Accept': '*/*',
-          'Referer': 'https://www.youtube.com/'
-        },
-        timeout: 20000,
-        maxContentLength: Infinity,
-        maxBodyLength: Infinity
-      });
-
-      res.setHeader('Content-Type', mimeType || 'audio/mp4');
-      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-      res.setHeader('Transfer-Encoding', 'chunked');
-
-      resp.data.pipe(res);
-
-      resp.data.on('error', (err) => {
-        console.error('Upstream stream error:', err && err.message ? err.message : err);
-        try { res.end(); } catch (e) {}
-      });
-
-      req.on('close', () => {
-        try { if (resp.data && resp.data.destroy) resp.data.destroy(); } catch (e) {}
-      });
-
-      return true;
-    } catch (err) {
-      throw err;
     }
-  };
+    // ensure Content-Type if missing
+    if (!res.getHeader('content-type')) res.setHeader('Content-Type', mimeType || 'audio/mp4');
 
-  try {
-    await attemptStream();
+    // Pipe the upstream stream to the client
+    upstream.data.pipe(res);
+
+    upstream.data.on('error', (err) => {
+      console.error('Upstream stream error:', err && err.message ? err.message : err);
+      try { res.end(); } catch (e) {}
+    });
+
+    // If the client disconnects, destroy upstream stream
+    req.on('close', () => {
+      try { if (upstream.data && typeof upstream.data.destroy === 'function') upstream.data.destroy(); } catch (e) {}
+    });
+
+    return;
   } catch (err) {
-    console.warn('First stream attempt failed:', err && err.message ? err.message : err);
-    const transient = /timed out|timeout|ECONNRESET|socket hang up|ENOTFOUND|ETIMEDOUT|ECONNREFUSED|502|503/i.test(err && err.message ? err.message : '');
-    if (transient) {
-      console.log('Retrying stream once due to transient error...');
-      try {
-        await attemptStream();
-        return;
-      } catch (err2) {
-        console.error('Retry stream failed:', err2 && err2.message ? err2.message : err2);
-        if (!res.headersSent) return res.status(502).send(`Proxy Error: ${err2.message || err2}`);
-      }
-    } else {
-      console.error('Stream proxy error (non-transient):', err && err.message ? err.message : err);
-      if (!res.headersSent) {
-        if (/restricted|age|private|blocked|not available|geo/i.test(err && err.message ? err.message : '')) {
-          return res.status(410).send(`Content Unavailable: ${err.message || err}`);
-        }
-        return res.status(500).send(`Server Error: ${err.message || err}`);
-      }
+    console.warn('Stream proxy error:', err && err.message ? err.message : err);
+    const msg = err && err.message ? err.message : 'Unknown';
+    if (/restricted|age|private|blocked|not available|geo|This video is unavailable/i.test(msg)) {
+      return res.status(410).send(`Content Unavailable: ${msg}`);
     }
+    return res.status(500).send(`Server Error: ${msg}`);
   }
 });
 
-// ------------------ DEBUG endpoint (useful for diagnostics) ------------------
+// ------------------ DEBUG endpoint ------------------
 app.get('/debug-info', async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).send({ ok: false, error: 'No url provided' });
@@ -381,7 +379,6 @@ function makePlayNext(roomCode) {
 io.on('connection', (socket) => {
   console.log(`⚡ User connected: ${socket.id}`);
 
-  // request handlers
   socket.on('join_room', ({ roomCode, username }) => {
     socket.join(roomCode);
     if (!rooms[roomCode]) {
@@ -464,7 +461,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ------------------ VALIDATED request_song handler ------------------
+  // Validated request_song handler
   socket.on('request_song', async ({ roomCode, youtubeUrl, title, thumbnail }) => {
     try {
       // 1) Validate availability via getInfoWithCache (throws if unavailable)
