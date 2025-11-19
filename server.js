@@ -3,6 +3,8 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const youtubedl = require('youtube-dl-exec');
+// Prefer yt-dlp binary for better reliability on hosts like Render
+const ytdl = (url, args) => youtubedl(url, { ...args, youtubedl: 'yt-dlp' });
 
 const app = express();
 app.use(cors());
@@ -41,7 +43,7 @@ app.get('/debug', (req, res) => {
 async function getAudioLink(youtubeUrl) {
   try {
     console.log(`🎧 Fetching audio link for: ${youtubeUrl}`);
-    const output = await youtubedl(youtubeUrl, {
+    const output = await ytdl(youtubeUrl, {
       getUrl: true,
       format: 'bestaudio[ext=m4a]',
       noCheckCertificates: true,
@@ -210,7 +212,7 @@ io.on('connection', (socket) => {
       }
 
       console.log(`🔎 Searching: "${query}"`);
-      const output = await youtubedl(query, {
+      const output = await ytdl(query, {
         dumpSingleJson: true,
         defaultSearch: 'ytsearch5',
         noWarnings: true,
