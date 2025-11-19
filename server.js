@@ -2,9 +2,8 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const youtubedl = require('youtube-dl-exec');
-// Prefer yt-dlp binary for better reliability on hosts like Render
-const ytdl = (url, args) => youtubedl(url, { ...args, youtubedl: 'yt-dlp' });
+const ytdl = require('ytdl-core');
+const ytsr = require('ytsr');
 
 const app = express();
 app.use(cors());
@@ -43,14 +42,10 @@ app.get('/debug', (req, res) => {
 async function getAudioLink(youtubeUrl) {
   try {
     console.log(`🎧 Fetching audio link for: ${youtubeUrl}`);
-    const output = await ytdl(youtubeUrl, {
-      getUrl: true,
-      format: 'bestaudio[ext=m4a]',
-      noCheckCertificates: true,
-      noWarnings: true,
-      preferFreeFormats: true,
-    });
-    const link = output.trim();
+    const info = await ytdl.getInfo(youtubeUrl);
+    const audioFormats = ytdl.filterFormats(info.formats, 'audioonly');
+    const preferred = audioFormats.find(f => (f.mimeType || '').includes('audio/mp4')) || audioFormats[0];
+    const link = preferred ? preferred.url : null;
     console.log(`✅ Got audio link: ${link.substring(0, 50)}...`);
     return link;
   } catch (err) {
@@ -212,20 +207,14 @@ io.on('connection', (socket) => {
       }
 
       console.log(`🔎 Searching: "${query}"`);
-      const output = await ytdl(query, {
-        dumpSingleJson: true,
-        defaultSearch: 'ytsearch5',
-        noWarnings: true,
-        flatPlaylist: true,
-      });
-
-      const entries = output.entries || [];
+      const search = await ytsr(query, { limit: 10 });
+      const entries = search.items.filter(item => item.type === 'video').slice(0, 5);
       if (entries.length > 0) {
-        const results = entries.map(entry => ({
-          title: entry.title || 'Unknown',
-          id: entry.id,
-          url: `https://www.youtube.com/watch?v=${entry.id}`,
-          thumbnail: `https://i.ytimg.com/vi/${entry.id}/hqdefault.jpg`
+        const results = entries.map(item => ({
+          title: item.title || 'Unknown',
+          id: item.id,
+          url: item.url || `https://www.youtube.com/watch?v=${item.id}`,
+          thumbnail: (item.bestThumbnail && item.bestThumbnail.url) ? item.bestThumbnail.url : `https://i.ytimg.com/vi/${item.id}/hqdefault.jpg`
         }));
         console.log(`✅ Found ${results.length} results`);
         socket.emit('search_results', results);
