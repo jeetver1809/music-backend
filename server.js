@@ -13,7 +13,7 @@ app.use(express.json());
 
 app.get('/', (req, res) => res.send('Music Jam Server Online! 🚀'));
 
-// --- Initialize YouTube Innertube session ---
+// ------------------ YouTube Innertube init ------------------
 let yt = null;
 async function initYouTube() {
   try {
@@ -29,8 +29,7 @@ async function initYouTube() {
 initYouTube();
 
 // ------------------ Utilities ------------------
-
-// Extracts a YouTube video ID from common URL forms or accepts an ID directly.
+// Extract a YouTube video ID from various url forms or accept an ID
 function extractVideoId(urlOrId) {
   if (!urlOrId) return null;
   if (/^[0-9A-Za-z_-]{11}$/.test(urlOrId)) return urlOrId;
@@ -97,9 +96,9 @@ setInterval(() => {
   for (const [k, v] of formatCache.entries()) if (v.expiresAt <= now) formatCache.delete(k);
 }, 60 * 1000);
 
-// ------------------ YouTube info & format helpers ------------------
+// ------------------ YouTube helpers ------------------
 
-// Always call Innertube with a VIDEO ID (safer). Coalesce concurrent fetches.
+// Always call Innertube with a VIDEO ID; coalesce concurrent fetches
 async function getInfoWithCache(urlOrId) {
   const id = extractVideoId(urlOrId) || urlOrId;
   if (!id) throw new Error('Invalid video id/url');
@@ -111,14 +110,12 @@ async function getInfoWithCache(urlOrId) {
   }
 
   if (inflightFetches.has(id)) {
-    // return the existing in-flight promise
     return inflightFetches.get(id);
   }
 
   const p = (async () => {
     try {
       if (!yt) await initYouTube();
-      // Use the video ID when calling getInfo (fixes some Innertube issues)
       const info = await yt.getInfo(id);
       infoCache.set(id, { info, expiresAt: Date.now() + INFO_CACHE_TTL_MS });
       return info;
@@ -131,7 +128,7 @@ async function getInfoWithCache(urlOrId) {
   return p;
 }
 
-// Find a usable format URL (prefer audio-only). Save short-lived format URLs in cache.
+// Find best usable audio/muxed format URL; cache short-lived format URLs
 async function getFormatWithCache(urlOrId) {
   const id = extractVideoId(urlOrId) || urlOrId;
   if (!id) throw new Error('Invalid video id/url');
@@ -142,7 +139,6 @@ async function getFormatWithCache(urlOrId) {
     return { url: fCached.url, mimeType: fCached.mimeType };
   }
 
-  // get info (cached/coalesced)
   let info;
   try {
     info = await getInfoWithCache(id);
@@ -150,7 +146,7 @@ async function getFormatWithCache(urlOrId) {
     throw new Error(`yt.getInfo failed: ${err && err.message ? err.message : err}`);
   }
 
-  // 1) Try innertube chooseFormat audio
+  // 1) Prefer audio-only format via Innertube helper
   try {
     if (info && typeof info.chooseFormat === 'function') {
       const best = info.chooseFormat({ type: 'audio', quality: 'best' });
@@ -163,7 +159,7 @@ async function getFormatWithCache(urlOrId) {
     console.warn('chooseFormat(audio) failed:', e && e.message ? e.message : e);
   }
 
-  // 2) Fallback: scan formats or streamingData for audio
+  // 2) Fallback: scan formats/adaptiveFormats for audio
   const formats = info.formats || (info.streamingData && (info.streamingData.adaptiveFormats || info.streamingData.formats)) || [];
   const candidates = [];
 
@@ -191,7 +187,7 @@ async function getFormatWithCache(urlOrId) {
     return { url: chosen.url, mimeType: chosen.mimeType || 'audio/mp4' };
   }
 
-  // 3) Last resort: pick any muxed format with a URL
+  // 3) Last resort: pick any muxed format with a url
   for (const f of formats) {
     if (f && f.url) {
       const mime = f.mimeType || '';
@@ -219,52 +215,55 @@ app.get('/stream', async (req, res) => {
 
   console.log(`🔄 Stream requested: ${videoUrl} from ${clientIp}`);
 
-  // helper to attempt streaming
   const attemptStream = async () => {
     const { url: formatUrl, mimeType } = await getFormatWithCache(videoUrl);
     if (!formatUrl) throw new Error('No format URL resolved');
 
-    // optional: HEAD check (some servers block HEAD; ignore HEAD failures)
     try {
-      await axios.head(formatUrl, {
-        headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.youtube.com/' },
-        timeout: 8000
+      // HEAD check (optional)
+      try {
+        await axios.head(formatUrl, {
+          headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.youtube.com/' },
+          timeout: 8000
+        });
+      } catch (hdrErr) {
+        // Sometimes HEAD fails; continue to GET
+        console.warn('HEAD check warning for format URL:', hdrErr && hdrErr.message ? hdrErr.message : hdrErr);
+      }
+
+      const resp = await axios({
+        method: 'get',
+        url: formatUrl,
+        responseType: 'stream',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+          'Accept': '*/*',
+          'Referer': 'https://www.youtube.com/'
+        },
+        timeout: 20000,
+        maxContentLength: Infinity,
+        maxBodyLength: Infinity
       });
-    } catch (herr) {
-      // HEAD sometimes fails even though GET works; log and continue
-      console.warn('HEAD check warning for format URL:', herr && herr.message ? herr.message : herr);
+
+      res.setHeader('Content-Type', mimeType || 'audio/mp4');
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+      res.setHeader('Transfer-Encoding', 'chunked');
+
+      resp.data.pipe(res);
+
+      resp.data.on('error', (err) => {
+        console.error('Upstream stream error:', err && err.message ? err.message : err);
+        try { res.end(); } catch (e) {}
+      });
+
+      req.on('close', () => {
+        try { if (resp.data && resp.data.destroy) resp.data.destroy(); } catch (e) {}
+      });
+
+      return true;
+    } catch (err) {
+      throw err;
     }
-
-    const resp = await axios({
-      method: 'get',
-      url: formatUrl,
-      responseType: 'stream',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-        'Accept': '*/*',
-        'Referer': 'https://www.youtube.com/'
-      },
-      timeout: 20000,
-      maxContentLength: Infinity,
-      maxBodyLength: Infinity
-    });
-
-    res.setHeader('Content-Type', mimeType || 'audio/mp4');
-    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-    res.setHeader('Transfer-Encoding', 'chunked');
-
-    resp.data.pipe(res);
-
-    resp.data.on('error', (err) => {
-      console.error('Upstream stream error:', err && err.message ? err.message : err);
-      try { res.end(); } catch (e) {}
-    });
-
-    req.on('close', () => {
-      try { if (resp.data && resp.data.destroy) resp.data.destroy(); } catch (e) {}
-    });
-
-    return true;
   };
 
   try {
@@ -293,8 +292,50 @@ app.get('/stream', async (req, res) => {
   }
 });
 
-// ------------------ Socket.IO + room logic ------------------
+// ------------------ DEBUG endpoint (useful for diagnostics) ------------------
+app.get('/debug-info', async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).send({ ok: false, error: 'No url provided' });
 
+  const id = extractVideoId(url);
+  if (!id) return res.status(400).send({ ok: false, error: 'Could not extract video id' });
+
+  try {
+    if (!yt) await initYouTube();
+    const info = await yt.getInfo(id);
+
+    const title = (info.videoDetails && info.videoDetails.title) || info.title || 'Unknown';
+    const playability = info.playabilityStatus || {};
+    const isLive = !!(info.isLive || (info.videoDetails && info.videoDetails.isLive));
+    const formats = info.formats || (info.streamingData && (info.streamingData.adaptiveFormats || info.streamingData.formats)) || [];
+
+    const formatsSummary = formats.slice(0, 50).map(f => ({
+      itag: f.itag || null,
+      container: f.container || null,
+      mimeType: f.mimeType || null,
+      audioCodec: f.audioCodec || null,
+      qualityLabel: f.qualityLabel || null,
+      bitrate: f.bitrate || f.averageBitrate || null,
+      hasUrl: !!f.url,
+      approxSizeMb: f.contentLength ? Math.round((Number(f.contentLength)||0)/(1024*1024)) : null
+    }));
+
+    return res.send({
+      ok: true,
+      id,
+      title,
+      isLive,
+      playability,
+      formatsCount: formats.length,
+      formatsPreview: formatsSummary
+    });
+  } catch (err) {
+    console.error('debug-info error', err && err.message ? err.message : err);
+    return res.status(500).send({ ok: false, error: err && err.message ? err.message : String(err) });
+  }
+});
+
+// ------------------ Socket.IO + room logic ------------------
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] }
@@ -310,10 +351,9 @@ const socketRequestSongCounts = new Map();
 const REQUEST_WINDOW_MS = 60 * 1000;
 const REQUEST_MAX_PER_WINDOW = 10;
 
-io.on('connection', (socket) => {
-  console.log(`⚡ User connected: ${socket.id}`);
-
-  const playNext = (roomCode) => {
+// Helper: play next in a room
+function makePlayNext(roomCode) {
+  return function playNext() {
     const room = rooms[roomCode];
     if (!room || room.queue.length === 0) {
       if (room) room.isPlaying = false;
@@ -336,7 +376,12 @@ io.on('connection', (socket) => {
     });
     io.to(roomCode).emit('queue_updated', room.queue);
   };
+}
 
+io.on('connection', (socket) => {
+  console.log(`⚡ User connected: ${socket.id}`);
+
+  // request handlers
   socket.on('join_room', ({ roomCode, username }) => {
     socket.join(roomCode);
     if (!rooms[roomCode]) {
@@ -419,47 +464,68 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ------------------ VALIDATED request_song handler ------------------
   socket.on('request_song', async ({ roomCode, youtubeUrl, title, thumbnail }) => {
-    const now = Date.now();
-    let srec = socketRequestSongCounts.get(socket.id);
-    if (!srec || now - srec.windowStart > REQUEST_WINDOW_MS) {
-      srec = { count: 0, windowStart: now };
-    }
-    if (srec.count >= REQUEST_MAX_PER_WINDOW) {
-      return socket.emit('song_error', 'Too many song requests — slow down.');
-    }
-    srec.count += 1;
-    socketRequestSongCounts.set(socket.id, srec);
+    try {
+      // 1) Validate availability via getInfoWithCache (throws if unavailable)
+      try {
+        await getInfoWithCache(youtubeUrl);
+      } catch (infoErr) {
+        console.warn('request_song: getInfo failed for', youtubeUrl, infoErr && infoErr.message ? infoErr.message : infoErr);
+        return socket.emit('song_error', `Cannot add "${title || 'this video'}": ${infoErr.message || 'unavailable'}`);
+      }
 
-    if (!rooms[roomCode]) {
-      rooms[roomCode] = {
-        currentSongUrl: null,
-        currentTitle: "No Song Playing",
-        currentThumbnail: null,
-        queue: [],
-        users: [],
-        isPlaying: false,
-        timestamp: 0,
-        lastUpdate: Date.now()
-      };
-    }
+      // 2) Per-socket rate limit for adding songs
+      const now = Date.now();
+      let srec = socketRequestSongCounts.get(socket.id);
+      if (!srec || now - srec.windowStart > REQUEST_WINDOW_MS) {
+        srec = { count: 0, windowStart: now };
+      }
+      if (srec.count >= REQUEST_MAX_PER_WINDOW) {
+        return socket.emit('song_error', 'Too many song requests — slow down.');
+      }
+      srec.count += 1;
+      socketRequestSongCounts.set(socket.id, srec);
 
-    const room = rooms[roomCode];
-    room.queue.push({
-      title: title,
-      thumbnail: thumbnail,
-      originalUrl: youtubeUrl,
-      audioUrl: null
-    });
+      // 3) Ensure room exists and push to queue
+      if (!rooms[roomCode]) {
+        rooms[roomCode] = {
+          currentSongUrl: null,
+          currentTitle: "No Song Playing",
+          currentThumbnail: null,
+          queue: [],
+          users: [],
+          isPlaying: false,
+          timestamp: 0,
+          lastUpdate: Date.now()
+        };
+      }
 
-    io.to(roomCode).emit('queue_updated', room.queue);
+      const room = rooms[roomCode];
+      room.queue.push({
+        title: title,
+        thumbnail: thumbnail,
+        originalUrl: youtubeUrl,
+        audioUrl: null
+      });
 
-    if (!room.isPlaying) {
-      playNext(roomCode);
+      io.to(roomCode).emit('queue_updated', room.queue);
+
+      // 4) If nothing is playing, start playback
+      if (!room.isPlaying) {
+        const playNext = makePlayNext(roomCode);
+        playNext();
+      }
+    } catch (e) {
+      console.error('request_song: unexpected error', e && e.message ? e.message : e);
+      socket.emit('song_error', 'Server error while adding song.');
     }
   });
 
-  socket.on('skip_track', (roomCode) => playNext(roomCode));
+  socket.on('skip_track', (roomCode) => {
+    const playNext = makePlayNext(roomCode);
+    playNext();
+  });
 
   socket.on('pause_track', ({ roomCode, timestamp }) => {
     if (rooms[roomCode]) {
