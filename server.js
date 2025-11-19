@@ -13,7 +13,7 @@ app.use(express.json());
 
 app.get('/', (req, res) => res.send('Music Jam Server Online! 🚀'));
 
-// --- YT Init ---
+// --- Initialize YouTube Innertube session ---
 let yt = null;
 async function initYouTube() {
   try {
@@ -23,12 +23,14 @@ async function initYouTube() {
     });
     console.log("✅ YouTube InnerTube Initialized!");
   } catch (e) {
-    console.error("❌ Failed to init YouTube:", e);
+    console.error("❌ Failed to init YouTube:", e && e.message ? e.message : e);
   }
 }
 initYouTube();
 
-// --- Utilities: ID extraction ---
+// ------------------ Utilities ------------------
+
+// Extracts a YouTube video ID from common URL forms or accepts an ID directly.
 function extractVideoId(urlOrId) {
   if (!urlOrId) return null;
   if (/^[0-9A-Za-z_-]{11}$/.test(urlOrId)) return urlOrId;
@@ -42,11 +44,11 @@ function extractVideoId(urlOrId) {
   return m ? m[1] : null;
 }
 
-// ------------------- RATE LIMIT / CACHING -------------------
+// ------------------ Rate limiting & caching ------------------
 
-// --- 1) IP Token-bucket limiter for /stream ---
-const RATE_CAPACITY = 30; // tokens
-const RATE_WINDOW_MS = 60 * 1000; // 60s
+// IP token-bucket limiter for /stream
+const RATE_CAPACITY = 30; // tokens per window
+const RATE_WINDOW_MS = 60 * 1000; // window size in ms (60s)
 const TOKEN_REFILL_PER_MS = RATE_CAPACITY / RATE_WINDOW_MS;
 const ipBuckets = new Map(); // ip -> { tokens, last }
 
@@ -70,25 +72,34 @@ function allowRequestFromIp(ip) {
   return false;
 }
 
-// GC old IP buckets
+// GC old IP buckets periodically
 setInterval(() => {
   const now = Date.now();
   for (const [ip, bucket] of ipBuckets.entries()) {
-    if (now - bucket.last > 30 * 60 * 1000) {
+    if (now - bucket.last > 30 * 60 * 1000) { // 30 minutes idle
       ipBuckets.delete(ip);
     }
   }
 }, 10 * 60 * 1000);
 
-// --- 2) Short-lived caches ---
-const INFO_CACHE_TTL_MS = 5 * 60 * 1000;  // 5 min
-const FORMAT_CACHE_TTL_MS = 30 * 1000;    // 30 sec
+// Short-lived caches
+const INFO_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const FORMAT_CACHE_TTL_MS = 30 * 1000;   // 30 seconds
 
 const infoCache = new Map();   // videoId -> { info, expiresAt }
 const formatCache = new Map(); // videoId -> { url, mimeType, expiresAt }
 const inflightFetches = new Map(); // videoId -> Promise
 
-// ❗ FIXED: getInfoWithCache now ALWAYS calls yt.getInfo with VIDEO ID, not full URL
+// Cleanup caches periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of infoCache.entries()) if (v.expiresAt <= now) infoCache.delete(k);
+  for (const [k, v] of formatCache.entries()) if (v.expiresAt <= now) formatCache.delete(k);
+}, 60 * 1000);
+
+// ------------------ YouTube info & format helpers ------------------
+
+// Always call Innertube with a VIDEO ID (safer). Coalesce concurrent fetches.
 async function getInfoWithCache(urlOrId) {
   const id = extractVideoId(urlOrId) || urlOrId;
   if (!id) throw new Error('Invalid video id/url');
@@ -100,13 +111,14 @@ async function getInfoWithCache(urlOrId) {
   }
 
   if (inflightFetches.has(id)) {
+    // return the existing in-flight promise
     return inflightFetches.get(id);
   }
 
   const p = (async () => {
     try {
       if (!yt) await initYouTube();
-      // 👉 Use pure video ID here (this was the bug earlier)
+      // Use the video ID when calling getInfo (fixes some Innertube issues)
       const info = await yt.getInfo(id);
       infoCache.set(id, { info, expiresAt: Date.now() + INFO_CACHE_TTL_MS });
       return info;
@@ -119,7 +131,7 @@ async function getInfoWithCache(urlOrId) {
   return p;
 }
 
-// Helper: getFormatWithCache(videoIdOrUrl) -> { url, mimeType }
+// Find a usable format URL (prefer audio-only). Save short-lived format URLs in cache.
 async function getFormatWithCache(urlOrId) {
   const id = extractVideoId(urlOrId) || urlOrId;
   if (!id) throw new Error('Invalid video id/url');
@@ -130,32 +142,76 @@ async function getFormatWithCache(urlOrId) {
     return { url: fCached.url, mimeType: fCached.mimeType };
   }
 
-  const info = await getInfoWithCache(urlOrId);
-  const format = info.chooseFormat({ type: 'audio', quality: 'best' });
-  if (!format || !format.url) throw new Error('No audio format found');
+  // get info (cached/coalesced)
+  let info;
+  try {
+    info = await getInfoWithCache(id);
+  } catch (err) {
+    throw new Error(`yt.getInfo failed: ${err && err.message ? err.message : err}`);
+  }
 
-  formatCache.set(id, {
-    url: format.url,
-    mimeType: format.mimeType || 'audio/mp4',
-    expiresAt: Date.now() + FORMAT_CACHE_TTL_MS
-  });
+  // 1) Try innertube chooseFormat audio
+  try {
+    if (info && typeof info.chooseFormat === 'function') {
+      const best = info.chooseFormat({ type: 'audio', quality: 'best' });
+      if (best && best.url) {
+        formatCache.set(id, { url: best.url, mimeType: best.mimeType || 'audio/mp4', expiresAt: Date.now() + FORMAT_CACHE_TTL_MS });
+        return { url: best.url, mimeType: best.mimeType || 'audio/mp4' };
+      }
+    }
+  } catch (e) {
+    console.warn('chooseFormat(audio) failed:', e && e.message ? e.message : e);
+  }
 
-  return { url: format.url, mimeType: format.mimeType || 'audio/mp4' };
+  // 2) Fallback: scan formats or streamingData for audio
+  const formats = info.formats || (info.streamingData && (info.streamingData.adaptiveFormats || info.streamingData.formats)) || [];
+  const candidates = [];
+
+  for (const f of formats) {
+    const mime = f.mimeType || '';
+    const hasAudioCodec = /audio/i.test(mime) || !!f.audioCodec || !!f.audioQuality || !!f.audioSampleRate;
+    const hasUrl = !!f.url;
+    if (hasUrl && hasAudioCodec) {
+      candidates.push({
+        url: f.url,
+        mimeType: f.mimeType || (f.container ? `audio/${f.container}` : 'audio/mp4'),
+        bitrate: f.bitrate || f.averageBitrate || 0,
+        audioOnly: /audio\/|audioonly|m4a|webm/.test(mime)
+      });
+    }
+  }
+
+  if (candidates.length > 0) {
+    candidates.sort((a, b) => {
+      if (a.audioOnly !== b.audioOnly) return a.audioOnly ? -1 : 1;
+      return (b.bitrate || 0) - (a.bitrate || 0);
+    });
+    const chosen = candidates[0];
+    formatCache.set(id, { url: chosen.url, mimeType: chosen.mimeType || 'audio/mp4', expiresAt: Date.now() + FORMAT_CACHE_TTL_MS });
+    return { url: chosen.url, mimeType: chosen.mimeType || 'audio/mp4' };
+  }
+
+  // 3) Last resort: pick any muxed format with a URL
+  for (const f of formats) {
+    if (f && f.url) {
+      const mime = f.mimeType || '';
+      if (/mp4|webm|ogg/i.test(mime) || f.container) {
+        formatCache.set(id, { url: f.url, mimeType: f.mimeType || 'video/mp4', expiresAt: Date.now() + FORMAT_CACHE_TTL_MS });
+        return { url: f.url, mimeType: f.mimeType || 'video/mp4' };
+      }
+    }
+  }
+
+  throw new Error('No usable audio or muxed format URL found for video (maybe restricted or removed)');
 }
 
-// Clear expired cache entries
-setInterval(() => {
-  const now = Date.now();
-  for (const [k, v] of infoCache.entries()) if (v.expiresAt <= now) infoCache.delete(k);
-  for (const [k, v] of formatCache.entries()) if (v.expiresAt <= now) formatCache.delete(k);
-}, 60 * 1000);
+// ------------------ /stream endpoint ------------------
 
-// ------------------- STREAM ENDPOINT -------------------
 app.get('/stream', async (req, res) => {
   const videoUrl = req.query.url;
   if (!videoUrl) return res.status(400).send('No URL provided');
 
-  const clientIp = req.ip || req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+  const clientIp = req.ip || req.headers['x-forwarded-for'] || (req.connection && req.connection.remoteAddress);
   if (!allowRequestFromIp(clientIp)) {
     res.setHeader('Retry-After', '60');
     return res.status(429).send('Too many requests — slow down');
@@ -163,8 +219,21 @@ app.get('/stream', async (req, res) => {
 
   console.log(`🔄 Stream requested: ${videoUrl} from ${clientIp}`);
 
-  try {
+  // helper to attempt streaming
+  const attemptStream = async () => {
     const { url: formatUrl, mimeType } = await getFormatWithCache(videoUrl);
+    if (!formatUrl) throw new Error('No format URL resolved');
+
+    // optional: HEAD check (some servers block HEAD; ignore HEAD failures)
+    try {
+      await axios.head(formatUrl, {
+        headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.youtube.com/' },
+        timeout: 8000
+      });
+    } catch (herr) {
+      // HEAD sometimes fails even though GET works; log and continue
+      console.warn('HEAD check warning for format URL:', herr && herr.message ? herr.message : herr);
+    }
 
     const resp = await axios({
       method: 'get',
@@ -187,7 +256,7 @@ app.get('/stream', async (req, res) => {
     resp.data.pipe(res);
 
     resp.data.on('error', (err) => {
-      console.error('Upstream stream error:', err && err.message);
+      console.error('Upstream stream error:', err && err.message ? err.message : err);
       try { res.end(); } catch (e) {}
     });
 
@@ -195,13 +264,37 @@ app.get('/stream', async (req, res) => {
       try { if (resp.data && resp.data.destroy) resp.data.destroy(); } catch (e) {}
     });
 
-  } catch (e) {
-    console.error('Stream proxy error:', e && e.message);
-    if (!res.headersSent) res.status(500).send(`Server Error: ${e.message}`);
+    return true;
+  };
+
+  try {
+    await attemptStream();
+  } catch (err) {
+    console.warn('First stream attempt failed:', err && err.message ? err.message : err);
+    const transient = /timed out|timeout|ECONNRESET|socket hang up|ENOTFOUND|ETIMEDOUT|ECONNREFUSED|502|503/i.test(err && err.message ? err.message : '');
+    if (transient) {
+      console.log('Retrying stream once due to transient error...');
+      try {
+        await attemptStream();
+        return;
+      } catch (err2) {
+        console.error('Retry stream failed:', err2 && err2.message ? err2.message : err2);
+        if (!res.headersSent) return res.status(502).send(`Proxy Error: ${err2.message || err2}`);
+      }
+    } else {
+      console.error('Stream proxy error (non-transient):', err && err.message ? err.message : err);
+      if (!res.headersSent) {
+        if (/restricted|age|private|blocked|not available|geo/i.test(err && err.message ? err.message : '')) {
+          return res.status(410).send(`Content Unavailable: ${err.message || err}`);
+        }
+        return res.status(500).send(`Server Error: ${err.message || err}`);
+      }
+    }
   }
 });
 
-// ------------------- SOCKET.IO (with simple throttles) -------------------
+// ------------------ Socket.IO + room logic ------------------
+
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] }
@@ -209,6 +302,7 @@ const io = new Server(server, {
 
 const rooms = {};
 
+// Simple socket throttles
 const socketSearchTimestamps = new Map();
 const SEARCH_MIN_INTERVAL_MS = 1500;
 
@@ -320,7 +414,7 @@ io.on('connection', (socket) => {
 
       socket.emit('search_results', results);
     } catch (e) {
-      console.error('Search failed', e && e.message);
+      console.error('Search failed', e && e.message ? e.message : e);
       socket.emit('song_error', 'Search failed.');
     }
   });
@@ -394,5 +488,6 @@ io.on('connection', (socket) => {
   });
 });
 
+// ------------------ Start server ------------------
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => console.log(`🚀 Server running on ${PORT}`));
