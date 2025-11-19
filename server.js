@@ -42,14 +42,44 @@ app.get('/debug', (req, res) => {
 async function getAudioLink(youtubeUrl) {
   try {
     console.log(`🎧 Fetching audio link for: ${youtubeUrl}`);
-    const info = await ytdl.getInfo(youtubeUrl);
+
+    // Normalize input: if it's an ID, build full URL
+    let url = youtubeUrl;
+    if (!/^https?:\/\//i.test(youtubeUrl)) {
+      url = `https://www.youtube.com/watch?v=${youtubeUrl}`;
+    }
+
+    if (!ytdl.validateURL(url)) {
+      console.warn(`⚠️ Invalid YouTube URL: ${url}`);
+      return null;
+    }
+
+    const info = await ytdl.getInfo(url);
+    console.log(`ℹ️ Video title: ${info.videoDetails?.title}`);
+
+    // Prefer audio-only formats with HLS or direct URL
     const audioFormats = ytdl.filterFormats(info.formats, 'audioonly');
-    const preferred = audioFormats.find(f => (f.mimeType || '').includes('audio/mp4')) || audioFormats[0];
-    const link = preferred ? preferred.url : null;
-    console.log(`✅ Got audio link: ${link.substring(0, 50)}...`);
+    if (!audioFormats || audioFormats.length === 0) {
+      console.warn('⚠️ No audio-only formats found');
+      return null;
+    }
+
+    // Prefer m4a/mp4, then anything else
+    const preferred =
+      audioFormats.find(f => (f.mimeType || '').includes('audio/mp4')) ||
+      audioFormats.find(f => (f.mimeType || '').includes('audio/webm')) ||
+      audioFormats[0];
+
+    if (!preferred || !preferred.url) {
+      console.warn('⚠️ No usable audio format URL found');
+      return null;
+    }
+
+    const link = preferred.url;
+    console.log(`✅ Got audio link: ${link.substring(0, 80)}...`);
     return link;
   } catch (err) {
-    console.error("❌ Link Fetch Error:", err.message);
+    console.error('❌ Link Fetch Error:', err);
     return null;
   }
 }
