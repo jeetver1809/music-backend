@@ -47,10 +47,9 @@ function extractVideoId(urlOrId) {
 // --- 1) IP Token-bucket limiter for /stream ---
 const RATE_CAPACITY = 30; // tokens
 const RATE_WINDOW_MS = 60 * 1000; // 60s
-const TOKEN_REFILL_PER_MS = RATE_CAPACITY / RATE_WINDOW_MS; // tokens added per ms
+const TOKEN_REFILL_PER_MS = RATE_CAPACITY / RATE_WINDOW_MS;
 const ipBuckets = new Map(); // ip -> { tokens, last }
 
-// returns true if allowed, false otherwise
 function allowRequestFromIp(ip) {
   if (!ip) return false;
   const now = Date.now();
@@ -71,49 +70,44 @@ function allowRequestFromIp(ip) {
   return false;
 }
 
-// Garbage-collect old IP buckets every 10 minutes to prevent memory growth
+// GC old IP buckets
 setInterval(() => {
   const now = Date.now();
   for (const [ip, bucket] of ipBuckets.entries()) {
-    if (now - bucket.last > 30 * 60 * 1000) { // 30 min idle
+    if (now - bucket.last > 30 * 60 * 1000) {
       ipBuckets.delete(ip);
     }
   }
 }, 10 * 60 * 1000);
 
 // --- 2) Short-lived caches ---
-// infoCache: caches yt.getInfo results (longer TTL so repeated plays/searches reuse it)
-const INFO_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-const infoCache = new Map(); // videoId -> { info, expiresAt }
+const INFO_CACHE_TTL_MS = 5 * 60 * 1000;  // 5 min
+const FORMAT_CACHE_TTL_MS = 30 * 1000;    // 30 sec
 
-// formatCache: caches chosen audio format URL (short TTL because format.url can expire quickly)
-const FORMAT_CACHE_TTL_MS = 30 * 1000; // 30 seconds
+const infoCache = new Map();   // videoId -> { info, expiresAt }
 const formatCache = new Map(); // videoId -> { url, mimeType, expiresAt }
-
-// inflightFetches: coalesce multiple simultaneous fetches for same video
 const inflightFetches = new Map(); // videoId -> Promise
 
-// Helper: getInfoWithCache(videoIdOrUrl)
+// ❗ FIXED: getInfoWithCache now ALWAYS calls yt.getInfo with VIDEO ID, not full URL
 async function getInfoWithCache(urlOrId) {
   const id = extractVideoId(urlOrId) || urlOrId;
   if (!id) throw new Error('Invalid video id/url');
 
-  const cached = infoCache.get(id);
   const now = Date.now();
+  const cached = infoCache.get(id);
   if (cached && cached.expiresAt > now) {
     return cached.info;
   }
 
   if (inflightFetches.has(id)) {
-    return inflightFetches.get(id); // return existing promise
+    return inflightFetches.get(id);
   }
 
   const p = (async () => {
     try {
       if (!yt) await initYouTube();
-      // Innertube can accept either id or url
-      const info = await yt.getInfo(urlOrId);
-      // store in cache
+      // 👉 Use pure video ID here (this was the bug earlier)
+      const info = await yt.getInfo(id);
       infoCache.set(id, { info, expiresAt: Date.now() + INFO_CACHE_TTL_MS });
       return info;
     } finally {
@@ -136,12 +130,10 @@ async function getFormatWithCache(urlOrId) {
     return { url: fCached.url, mimeType: fCached.mimeType };
   }
 
-  // fetch info (coalesced)
   const info = await getInfoWithCache(urlOrId);
   const format = info.chooseFormat({ type: 'audio', quality: 'best' });
   if (!format || !format.url) throw new Error('No audio format found');
 
-  // store short-lived format URL
   formatCache.set(id, {
     url: format.url,
     mimeType: format.mimeType || 'audio/mp4',
@@ -151,32 +143,29 @@ async function getFormatWithCache(urlOrId) {
   return { url: format.url, mimeType: format.mimeType || 'audio/mp4' };
 }
 
-// Periodically clear expired entries in caches (every minute)
+// Clear expired cache entries
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of infoCache.entries()) if (v.expiresAt <= now) infoCache.delete(k);
   for (const [k, v] of formatCache.entries()) if (v.expiresAt <= now) formatCache.delete(k);
 }, 60 * 1000);
 
-// ------------------- STREAM ENDPOINT (with IP rate limit + format cache) -------------------
+// ------------------- STREAM ENDPOINT -------------------
 app.get('/stream', async (req, res) => {
   const videoUrl = req.query.url;
   if (!videoUrl) return res.status(400).send('No URL provided');
 
-  // Rate-limit by client IP
   const clientIp = req.ip || req.headers['x-forwarded-for'] || req.connection.remoteAddress;
   if (!allowRequestFromIp(clientIp)) {
-    res.setHeader('Retry-After', '60'); // suggest retry after 60s
+    res.setHeader('Retry-After', '60');
     return res.status(429).send('Too many requests — slow down');
   }
 
   console.log(`🔄 Stream requested: ${videoUrl} from ${clientIp}`);
 
   try {
-    // Use cached or freshly-fetched audio format URL (coalesced)
     const { url: formatUrl, mimeType } = await getFormatWithCache(videoUrl);
 
-    // Proxy the stream (axios stream)
     const resp = await axios({
       method: 'get',
       url: formatUrl,
@@ -195,7 +184,6 @@ app.get('/stream', async (req, res) => {
     res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
     res.setHeader('Transfer-Encoding', 'chunked');
 
-    // Pipe to client
     resp.data.pipe(res);
 
     resp.data.on('error', (err) => {
@@ -203,7 +191,6 @@ app.get('/stream', async (req, res) => {
       try { res.end(); } catch (e) {}
     });
 
-    // If client disconnects, destroy upstream stream
     req.on('close', () => {
       try { if (resp.data && resp.data.destroy) resp.data.destroy(); } catch (e) {}
     });
@@ -214,7 +201,7 @@ app.get('/stream', async (req, res) => {
   }
 });
 
-// ------------------- SOCKET.IO (with simple socket throttles) -------------------
+// ------------------- SOCKET.IO (with simple throttles) -------------------
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] }
@@ -222,13 +209,12 @@ const io = new Server(server, {
 
 const rooms = {};
 
-// Socket throttles: per-socket last timestamps
-const socketSearchTimestamps = new Map(); // socketId -> lastSearchMs
-const SEARCH_MIN_INTERVAL_MS = 1500; // allow ~1 search per 1.5s
+const socketSearchTimestamps = new Map();
+const SEARCH_MIN_INTERVAL_MS = 1500;
 
-const socketRequestSongCounts = new Map(); // socketId -> { count, windowStart }
-const REQUEST_WINDOW_MS = 60 * 1000; // 1 minute
-const REQUEST_MAX_PER_WINDOW = 10; // max songs a socket can add per minute
+const socketRequestSongCounts = new Map();
+const REQUEST_WINDOW_MS = 60 * 1000;
+const REQUEST_MAX_PER_WINDOW = 10;
 
 io.on('connection', (socket) => {
   console.log(`⚡ User connected: ${socket.id}`);
@@ -314,8 +300,7 @@ io.on('connection', (socket) => {
       const last = socketSearchTimestamps.get(socket.id) || 0;
       const now = Date.now();
       if (now - last < SEARCH_MIN_INTERVAL_MS) {
-        // throttle - ignore or send empty
-        return socket.emit('search_results', []); 
+        return socket.emit('search_results', []);
       }
       socketSearchTimestamps.set(socket.id, now);
 
@@ -327,7 +312,10 @@ io.on('connection', (socket) => {
           title: item.title,
           id: item.id,
           url: item.url,
-          thumbnail: (item.bestThumbnail && item.bestThumbnail.url) || (item.thumbnails && item.thumbnails[0] && item.thumbnails[0].url) || null
+          thumbnail:
+            (item.bestThumbnail && item.bestThumbnail.url) ||
+            (item.thumbnails && item.thumbnails[0] && item.thumbnails[0].url) ||
+            null
         }));
 
       socket.emit('search_results', results);
@@ -338,14 +326,12 @@ io.on('connection', (socket) => {
   });
 
   socket.on('request_song', async ({ roomCode, youtubeUrl, title, thumbnail }) => {
-    // simple per-socket rate limit for adding songs
     const now = Date.now();
     let srec = socketRequestSongCounts.get(socket.id);
     if (!srec || now - srec.windowStart > REQUEST_WINDOW_MS) {
       srec = { count: 0, windowStart: now };
     }
     if (srec.count >= REQUEST_MAX_PER_WINDOW) {
-      // Too many requests from this socket in window
       return socket.emit('song_error', 'Too many song requests — slow down.');
     }
     srec.count += 1;
