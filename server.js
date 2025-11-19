@@ -1,22 +1,17 @@
-// server.js (Piped-first streaming)
-// Use a Piped instance to get audio stream URLs for YouTube videos.
-// Falls back to Innertube only if Piped doesn't provide usable audio (optional).
+// server.js (Fixed for Render & YouTube 410 Errors)
+// Includes Cookie Auth and User-Agent Spoofing
 
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const axios = require('axios');
-const ytsr = require('ytsr'); // for search
-// optional fallback - only used if Piped fails; comment out if you don't want fallback
 const { Innertube, UniversalCache } = require('youtubei.js');
+const ytsr = require('ytsr');
+const axios = require('axios');
 
 const app = express();
 app.use(express.json());
 
-// Debug screenshot path you uploaded (for your reference)
-const DEBUG_SCREENSHOT_PATH = '/mnt/data/98844ada-1e95-4e67-921b-46c187c1e25d.png';
-
-// ------------------ CORS (expose streaming headers) ------------------
+// ------------------ CORS ------------------
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,OPTIONS');
@@ -26,25 +21,29 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get('/', (req, res) => res.send('Music Jam Server Online! 🚀'));
+app.get('/', (req, res) => res.send('Music Jam Server Online (Patched) 🚀'));
 
-// ------------------ Config ------------------
-const PIPED_INSTANCE = process.env.PIPED_INSTANCE || 'https://pipedapi.kavin.rocks'; // change if you prefer
-const PORT = process.env.PORT || 3001;
-
-// ------------------ (Optional) Innertube fallback init ------------------
+// ------------------ YouTube Innertube Init ------------------
 let yt = null;
+
+// Function to Initialize YouTube with Cookie
 async function initYouTube() {
-  if (yt) return;
   try {
-    yt = await Innertube.create({ cache: new UniversalCache(false), generate_session_locally: true });
-    console.log('✅ Innertube initialized');
+    console.log("🔄 Initializing YouTube InnerTube...");
+    yt = await Innertube.create({
+      cache: new UniversalCache(false),
+      generate_session_locally: true,
+      // CRITICAL FIX: Inject cookie from Render Env Var
+      cookie: process.env.YT_COOKIE || '' 
+    });
+    console.log("✅ YouTube InnerTube Initialized (Cookie Loaded)!");
   } catch (e) {
-    console.warn('Innertube init failed:', e && e.message ? e.message : e);
+    console.error("❌ Failed to init YouTube:", e && e.message ? e.message : e);
   }
 }
+initYouTube();
 
-// ------------------ Utils ------------------
+// ------------------ Utilities ------------------
 function extractVideoId(urlOrId) {
   if (!urlOrId) return null;
   if (/^[0-9A-Za-z_-]{11}$/.test(urlOrId)) return urlOrId;
@@ -58,110 +57,9 @@ function extractVideoId(urlOrId) {
   return m ? m[1] : null;
 }
 
-// Basic mime guess by extension for direct urls
-function mimeForUrl(u) {
-  const m = u.match(/\.(mp3|m4a|mp4|webm|ogg)(?:\?|$)/i);
-  if (!m) return 'application/octet-stream';
-  switch (m[1].toLowerCase()) {
-    case 'mp3': return 'audio/mpeg';
-    case 'm4a': return 'audio/mp4';
-    case 'mp4': return 'video/mp4';
-    case 'webm': return 'audio/webm';
-    case 'ogg': return 'audio/ogg';
-    default: return 'application/octet-stream';
-  }
-}
-
-// ------------------ Piped helpers ------------------
-async function getPipedStreams(videoId) {
-  // videoId must be a plain id (11 chars)
-  if (!videoId) throw new Error('Invalid video id for piped');
-  const url = `${PIPED_INSTANCE}/streams/${videoId}`;
-  try {
-    const res = await axios.get(url, { timeout: 10_000 });
-    if (res && res.data) return res.data;
-    return null;
-  } catch (e) {
-    console.warn('Piped fetch failed:', e && (e.response && e.response.status) ? `${e.response.status}` : (e.message || e));
-    return null;
-  }
-}
-
-function chooseBestAudioFromPiped(pipedData) {
-  if (!pipedData) return null;
-  const audioStreams = pipedData.audioStreams || pipedData.audio || pipedData.streams || [];
-  if (!audioStreams || audioStreams.length === 0) return null;
-
-  // prefer audio with content-type containing 'audio' or 'm4a', sort by bitrate
-  const candidates = audioStreams
-    .map(s => ({
-      url: s.url || s.playUrl || s.cdnUrl || null,
-      mimeType: s.mimeType || s.type || null,
-      bitrate: s.bitrate || s.bandwidth || 0,
-      quality: s.quality || s.qualityLabel || null
-    }))
-    .filter(s => s.url);
-
-  if (candidates.length === 0) return null;
-
-  candidates.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-  return candidates[0];
-}
-
-// ------------------ Innertube fallback (optional) ------------------
-async function getInnertubeFormat(videoId) {
-  try {
-    await initYouTube();
-    if (!yt) throw new Error('Innertube not initialized');
-    const info = await yt.getInfo(videoId);
-    if (!info) return null;
-    // try chooseFormat
-    const fmt = info.chooseFormat ? info.chooseFormat({ type: 'audio', quality: 'best' }) : null;
-    if (fmt && fmt.url) return { url: fmt.url, mimeType: fmt.mimeType || mimeForUrl(fmt.url) };
-    // fallback scan
-    const formats = info.formats || (info.streamingData && (info.streamingData.adaptiveFormats || info.streamingData.formats)) || [];
-    for (const f of formats) {
-      if (f && f.url && (/audio/i.test(f.mimeType || '') || f.audioCodec)) {
-        return { url: f.url, mimeType: f.mimeType || mimeForUrl(f.url) };
-      }
-    }
-    return null;
-  } catch (e) {
-    console.warn('Innertube format fetch failed:', e && e.message ? e.message : e);
-    return null;
-  }
-}
-
-// ------------------ Format resolver (Piped-first, fallback to Innertube) ------------------
-async function resolveStreamUrl(inputUrl) {
-  // If direct HTTP(S) non-YT URL, return it raw
-  if (/^https?:\/\//i.test(inputUrl) && !/youtube\.com|youtu\.be|youtube-nocookie\.com/i.test(inputUrl)) {
-    return { url: inputUrl, mimeType: mimeForUrl(inputUrl) };
-  }
-
-  const id = extractVideoId(inputUrl);
-  if (!id) throw new Error('Invalid video id/url');
-
-  // 1) Try Piped
-  const piped = await getPipedStreams(id);
-  if (piped) {
-    const best = chooseBestAudioFromPiped(piped);
-    if (best && best.url) {
-      return { url: best.url, mimeType: best.mimeType || mimeForUrl(best.url) };
-    }
-  }
-
-  // 2) Fallback attempt: Innertube (useful if Piped instance is down)
-  const inn = await getInnertubeFormat(id);
-  if (inn && inn.url) return inn;
-
-  // 3) Nothing found
-  throw new Error('No usable audio format found (Piped+Innertube failed)');
-}
-
-// ------------------ Rate limiting (IP token-bucket) ------------------
-const RATE_CAPACITY = 30;
-const RATE_WINDOW_MS = 60_000;
+// ------------------ Rate Limiting & Caching ------------------
+const RATE_CAPACITY = 30; 
+const RATE_WINDOW_MS = 60 * 1000; 
 const TOKEN_REFILL_PER_MS = RATE_CAPACITY / RATE_WINDOW_MS;
 const ipBuckets = new Map();
 
@@ -185,31 +83,125 @@ function allowRequestFromIp(ip) {
   return false;
 }
 
+// Cache setup
+const INFO_CACHE_TTL_MS = 5 * 60 * 1000;
+const FORMAT_CACHE_TTL_MS = 30 * 1000;
+const infoCache = new Map();
+const formatCache = new Map();
+const inflightFetches = new Map();
+
+// GC Interval
 setInterval(() => {
   const now = Date.now();
-  for (const [k, v] of ipBuckets.entries()) {
-    if (now - v.last > 30 * 60_000) ipBuckets.delete(k);
+  for (const [ip, bucket] of ipBuckets.entries()) if (now - bucket.last > 30 * 60 * 1000) ipBuckets.delete(ip);
+  for (const [k, v] of infoCache.entries()) if (v.expiresAt <= now) infoCache.delete(k);
+  for (const [k, v] of formatCache.entries()) if (v.expiresAt <= now) formatCache.delete(k);
+}, 60 * 1000);
+
+// ------------------ YouTube Helpers ------------------
+
+async function getInfoWithCache(urlOrId) {
+  const id = extractVideoId(urlOrId) || urlOrId;
+  if (!id) throw new Error('Invalid video id/url');
+
+  const now = Date.now();
+  const cached = infoCache.get(id);
+  if (cached && cached.expiresAt > now) return cached.info;
+  if (inflightFetches.has(id)) return inflightFetches.get(id);
+
+  const p = (async () => {
+    try {
+      if (!yt) await initYouTube();
+      const info = await yt.getInfo(id);
+      infoCache.set(id, { info, expiresAt: Date.now() + INFO_CACHE_TTL_MS });
+      return info;
+    } finally {
+      inflightFetches.delete(id);
+    }
+  })();
+
+  inflightFetches.set(id, p);
+  return p;
+}
+
+async function getFormatWithCache(urlOrId) {
+  // Direct file bypass
+  if (typeof urlOrId === 'string' && /^https?:\/\//i.test(urlOrId) && !/youtube\.com|youtu\.be/i.test(urlOrId)) {
+    const extMatch = urlOrId.match(/\.(mp3|m4a|mp4|webm|ogg)(?:\?|$)/i);
+    const mimeType = extMatch && extMatch[1] === 'mp3' ? 'audio/mpeg' : 'application/octet-stream';
+    return { url: urlOrId, mimeType };
   }
-}, 10 * 60_000);
 
-// ------------------ /stream endpoint (Range-aware, mirrors upstream headers) ------------------
+  const id = extractVideoId(urlOrId) || urlOrId;
+  if (!id) throw new Error('Invalid video id/url');
+
+  const now = Date.now();
+  const fCached = formatCache.get(id);
+  if (fCached && fCached.expiresAt > now) return { url: fCached.url, mimeType: fCached.mimeType };
+
+  let info;
+  try {
+    info = await getInfoWithCache(id);
+  } catch (err) {
+    throw new Error(`yt.getInfo failed: ${err.message}`);
+  }
+
+  // 1) Try Audio Only
+  try {
+    if (info && typeof info.chooseFormat === 'function') {
+      const best = info.chooseFormat({ type: 'audio', quality: 'best' });
+      if (best && best.url) {
+        formatCache.set(id, { url: best.url, mimeType: best.mimeType || 'audio/mp4', expiresAt: Date.now() + FORMAT_CACHE_TTL_MS });
+        return { url: best.url, mimeType: best.mimeType || 'audio/mp4' };
+      }
+    }
+  } catch (e) {}
+
+  // 2) Manual Format Scan
+  const formats = info.formats || (info.streamingData && (info.streamingData.adaptiveFormats || info.streamingData.formats)) || [];
+  const candidates = [];
+
+  for (const f of formats) {
+    const mime = f.mimeType || '';
+    if (f.url && (/audio/i.test(mime) || f.audioCodec)) {
+      candidates.push({
+        url: f.url,
+        mimeType: f.mimeType || 'audio/mp4',
+        bitrate: f.bitrate || 0,
+        audioOnly: /audio\/|audioonly/.test(mime)
+      });
+    }
+  }
+
+  if (candidates.length > 0) {
+    candidates.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+    const chosen = candidates[0];
+    formatCache.set(id, { url: chosen.url, mimeType: chosen.mimeType, expiresAt: Date.now() + FORMAT_CACHE_TTL_MS });
+    return { url: chosen.url, mimeType: chosen.mimeType };
+  }
+
+  throw new Error('No usable audio format found');
+}
+
+// ------------------ The Proxy Endpoint (Fixed) ------------------
 app.get('/stream', async (req, res) => {
-  const inputUrl = req.query.url;
-  if (!inputUrl) return res.status(400).send('No url provided');
+  const videoUrl = req.query.url;
+  if (!videoUrl) return res.status(400).send('No URL provided');
 
-  const clientIp = req.ip || req.headers['x-forwarded-for'] || (req.connection && req.connection.remoteAddress);
+  const clientIp = req.ip || req.headers['x-forwarded-for'];
   if (!allowRequestFromIp(clientIp)) {
     res.setHeader('Retry-After', '60');
-    return res.status(429).send('Too many requests - slow down');
+    return res.status(429).send('Too many requests');
   }
 
-  try {
-    const { url: upstreamUrl, mimeType } = await resolveStreamUrl(inputUrl);
-    if (!upstreamUrl) throw new Error('No upstream url');
+  console.log(`🔄 Stream requested: ${videoUrl}`);
 
-    // Forward Range header if present
+  try {
+    const { url: formatUrl, mimeType } = await getFormatWithCache(videoUrl);
+    
+    // CRITICAL FIX: Real Browser Headers for the Proxy Request
     const forwardHeaders = {
-      'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       'Referer': 'https://www.youtube.com/',
       'Accept': '*/*'
     };
@@ -217,282 +209,147 @@ app.get('/stream', async (req, res) => {
 
     const upstream = await axios({
       method: 'get',
-      url: upstreamUrl,
+      url: formatUrl,
       responseType: 'stream',
       headers: forwardHeaders,
-      timeout: 20000,
-      maxContentLength: Infinity,
-      maxBodyLength: Infinity,
-      validateStatus: status => (status >= 200 && status < 400) // allow 206
+      timeout: 30000, // Increased timeout
+      validateStatus: status => (status >= 200 && status < 400)
     });
 
-    // copy safe headers and status so browser/media element can handle partial content
-    const whitelist = ['content-range', 'accept-ranges', 'content-length', 'content-type', 'etag', 'cache-control'];
     res.status(upstream.status);
-    for (const h of whitelist) {
+    
+    const headerWhitelist = ['content-range','accept-ranges','content-length','content-type','etag','cache-control'];
+    for (const h of headerWhitelist) {
       if (upstream.headers[h]) res.setHeader(h, upstream.headers[h]);
     }
-    if (!res.getHeader('content-type')) res.setHeader('Content-Type', mimeType || 'audio/mpeg');
+    if (!res.getHeader('content-type')) res.setHeader('Content-Type', mimeType || 'audio/mp4');
 
     upstream.data.pipe(res);
-    upstream.data.on('error', (e) => {
-      try { res.end(); } catch (err) {}
+
+    upstream.data.on('error', (err) => {
+      console.error('Stream error:', err.message);
+      res.end(); 
     });
+
     req.on('close', () => {
-      try { if (upstream.data && typeof upstream.data.destroy === 'function') upstream.data.destroy(); } catch (e) {}
+      if (upstream.data && typeof upstream.data.destroy === 'function') upstream.data.destroy();
     });
 
   } catch (err) {
-    const msg = (err && err.message) ? err.message : String(err);
-    console.warn('Stream error:', msg);
-    if (/No usable audio|unavailable|No upstream url|Invalid video id/i.test(msg)) {
-      return res.status(410).send(`Content Unavailable: ${msg}`);
+    console.warn('Proxy error:', err.message);
+    if (/unavailable|410|403|restricted/i.test(err.message)) {
+      return res.status(410).send(`Content Unavailable: ${err.message}`);
     }
-    return res.status(500).send(`Server Error: ${msg}`);
+    return res.status(500).send(`Server Error: ${err.message}`);
   }
 });
 
-// ------------------ /debug-info endpoint ------------------
+// ------------------ Debug Info ------------------
 app.get('/debug-info', async (req, res) => {
-  const inputUrl = req.query.url;
-  if (!inputUrl) return res.status(400).send({ ok: false, error: 'No url provided' });
+  const url = req.query.url;
+  if (!url) return res.status(400).send({ ok: false, error: 'No url' });
+  const id = extractVideoId(url);
+  if (!id) return res.status(400).send({ ok: false, error: 'No id' });
 
-  const id = extractVideoId(inputUrl);
-  if (!id) return res.status(400).send({ ok: false, error: 'Could not extract video id' });
-
-  // Try Piped
-  const piped = await getPipedStreams(id);
-  let pipedPreview = null;
-  if (piped) {
-    pipedPreview = {
-      title: piped.title || null,
-      audioCount: (piped.audioStreams || []).length,
-      audioPreview: (piped.audioStreams || []).slice(0,10).map(s => ({ mimeType: s.mimeType || s.type, bitrate: s.bitrate || s.bandwidth || null, hasUrl: !!(s.url || s.playUrl) }))
-    };
-  }
-
-  // Innertube info (best-effort)
-  let innInfo = null;
   try {
-    await initYouTube();
-    if (yt) {
-      const info = await yt.getInfo(id);
-      innInfo = {
-        title: (info.videoDetails && info.videoDetails.title) || info.title || 'Unknown',
-        formatsCount: (info.formats || []).length,
-        playability: info.playabilityStatus || {}
-      };
-    }
-  } catch (e) {
-    innInfo = { error: e && e.message ? e.message : String(e) };
+    if (!yt) await initYouTube();
+    const info = await yt.getInfo(id);
+    return res.send({
+      ok: true,
+      title: info.basic_info.title,
+      author: info.basic_info.author,
+      id: id
+    });
+  } catch (err) {
+    return res.status(500).send({ ok: false, error: err.message });
   }
-
-  return res.send({
-    ok: true,
-    id,
-    piped: pipedPreview,
-    innertube: innInfo,
-    debugScreenshot: DEBUG_SCREENSHOT_PATH
-  });
 });
 
-// ------------------ Socket.IO room & queue logic ------------------
+// ------------------ Socket.IO ------------------
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST'] } });
+const io = new Server(server, {
+  cors: { origin: "*", methods: ["GET", "POST"] }
+});
 
 const rooms = {};
 const socketSearchTimestamps = new Map();
-const SEARCH_MIN_INTERVAL_MS = 1500;
-const socketRequestSongCounts = new Map();
-const REQUEST_WINDOW_MS = 60_000;
-const REQUEST_MAX_PER_WINDOW = 10;
-
-function makePlayNext(roomCode) {
-  return async function playNext() {
-    const room = rooms[roomCode];
-    if (!room || room.queue.length === 0) {
-      if (room) room.isPlaying = false;
-      return;
-    }
-    const nextSong = room.queue.shift();
-
-    // Attempt to resolve stream URL (Piped-first) - this may throw
-    try {
-      const resolved = await resolveStreamUrl(nextSong.originalUrl);
-      if (!resolved || !resolved.url) {
-        io.to(roomCode).emit('song_error', `Could not resolve: ${nextSong.title}`);
-        // continue to next
-        setImmediate(playNext);
-        return;
-      }
-
-      room.currentSongUrl = resolved.url;
-      room.currentTitle = nextSong.title || 'Unknown';
-      room.currentThumbnail = nextSong.thumbnail || null;
-      room.isPlaying = true;
-      room.timestamp = 0;
-      room.lastUpdate = Date.now();
-
-      io.to(roomCode).emit('play_song', {
-        url: room.currentSongUrl,
-        title: room.currentTitle,
-        thumbnail: room.currentThumbnail
-      });
-      io.to(roomCode).emit('queue_updated', room.queue);
-
-    } catch (e) {
-      console.warn('playNext resolve failed:', e && e.message ? e.message : e);
-      io.to(roomCode).emit('song_error', `Could not load: ${nextSong.title}`);
-      setImmediate(playNext);
-    }
-  };
-}
 
 io.on('connection', (socket) => {
-  console.log('Socket connected', socket.id);
+  console.log(`⚡ Connected: ${socket.id}`);
 
   socket.on('join_room', ({ roomCode, username }) => {
     socket.join(roomCode);
     if (!rooms[roomCode]) {
       rooms[roomCode] = {
-        currentSongUrl: null,
-        currentTitle: 'No Song Playing',
-        currentThumbnail: null,
-        queue: [],
-        users: [],
-        isPlaying: false,
-        timestamp: 0,
-        lastUpdate: Date.now()
+        currentSongUrl: null, currentTitle: "No Song Playing", currentThumbnail: null,
+        queue: [], users: [], isPlaying: false, timestamp: 0, lastUpdate: Date.now()
       };
     }
     const room = rooms[roomCode];
-    const newUser = { id: socket.id, name: username || `User ${socket.id.substr(0,4)}` };
-    if (!room.users.find(u => u.id === socket.id)) room.users.push(newUser);
-    io.to(roomCode).emit('update_users', room.users);
-
-    let adjustedTime = room.timestamp;
-    if (room.isPlaying) {
-      adjustedTime += (Date.now() - room.lastUpdate) / 1000;
+    if (!room.users.find(u => u.id === socket.id)) {
+      room.users.push({ id: socket.id, name: username || `User ${socket.id.substr(0,4)}` });
     }
+    io.to(roomCode).emit('update_users', room.users);
+    
+    let adjustedTime = room.timestamp;
+    if (room.isPlaying) adjustedTime += (Date.now() - room.lastUpdate) / 1000;
 
     socket.emit('sync_state', {
-      url: room.currentSongUrl,
-      title: room.currentTitle,
-      thumbnail: room.currentThumbnail,
-      isPlaying: room.isPlaying,
-      timestamp: adjustedTime,
-      queue: room.queue
+      url: room.currentSongUrl, title: room.currentTitle, thumbnail: room.currentThumbnail,
+      isPlaying: room.isPlaying, timestamp: adjustedTime, queue: room.queue
     });
   });
 
   socket.on('disconnect', () => {
-    for (const rc in rooms) {
-      const room = rooms[rc];
+    for (const roomCode in rooms) {
+      const room = rooms[roomCode];
       const idx = room.users.findIndex(u => u.id === socket.id);
       if (idx !== -1) {
         room.users.splice(idx, 1);
-        io.to(rc).emit('update_users', room.users);
-        if (room.users.length === 0) delete rooms[rc];
+        io.to(roomCode).emit('update_users', room.users);
+        if (room.users.length === 0) delete rooms[roomCode];
         break;
       }
     }
     socketSearchTimestamps.delete(socket.id);
-    socketRequestSongCounts.delete(socket.id);
-    console.log('Socket disconnected', socket.id);
   });
 
   socket.on('search_query', async (query) => {
-    try {
-      const last = socketSearchTimestamps.get(socket.id) || 0;
-      const now = Date.now();
-      if (now - last < SEARCH_MIN_INTERVAL_MS) return socket.emit('search_results', []);
-      socketSearchTimestamps.set(socket.id, now);
+    const last = socketSearchTimestamps.get(socket.id) || 0;
+    if (Date.now() - last < 1500) return socket.emit('search_results', []);
+    socketSearchTimestamps.set(socket.id, Date.now());
 
-      const resultsRaw = await ytsr(query, { limit: 10 });
-      const results = (resultsRaw.items || []).filter(i => i.type === 'video').slice(0,8).map(item => ({
-        title: item.title,
-        id: item.id,
-        url: item.url,
-        thumbnail: (item.bestThumbnail && item.bestThumbnail.url) || (item.thumbnails && item.thumbnails[0] && item.thumbnails[0].url) || null
-      }));
+    try {
+      const search = await ytsr(query, { limit: 10 });
+      const results = (search.items || []).filter(i => i.type === 'video').slice(0,8)
+        .map(i => ({
+          title: i.title, id: i.id, url: i.url,
+          thumbnail: i.bestThumbnail?.url || i.thumbnails?.[0]?.url
+        }));
       socket.emit('search_results', results);
-    } catch (e) {
-      console.warn('search failed', e && e.message ? e.message : e);
-      socket.emit('song_error', 'Search failed.');
-    }
+    } catch (e) { socket.emit('song_error', 'Search failed'); }
   });
 
   socket.on('request_song', async ({ roomCode, youtubeUrl, title, thumbnail }) => {
     try {
-      // validate: if youtube url, check piped returns something
+      // Validate YT ID
       const id = extractVideoId(youtubeUrl);
-      if (id) {
-        const piped = await getPipedStreams(id);
-        if (!piped || !(piped.audioStreams && piped.audioStreams.length > 0)) {
-          // try innertube to check availability (best-effort)
-          let innOk = false;
-          try {
-            await initYouTube();
-            if (yt) {
-              const info = await yt.getInfo(id);
-              innOk = !!(info && (info.formats || []).length);
-            }
-          } catch (e) {
-            innOk = false;
-          }
-          if (!innOk) {
-            return socket.emit('song_error', `Cannot add "${title || 'this video'}": unavailable or restricted.`);
-          }
-        }
-      } else {
-        // non-yt URL - quick HEAD check
-        try {
-          await axios.head(youtubeUrl, { timeout: 8000 });
-        } catch (e) {
-          return socket.emit('song_error', `Cannot add "${title || 'this file'}": unreachable.`);
-        }
-      }
-
-      // per-socket add rate limit
-      const now = Date.now();
-      let rec = socketRequestSongCounts.get(socket.id);
-      if (!rec || now - rec.windowStart > REQUEST_WINDOW_MS) rec = { count: 0, windowStart: now };
-      if (rec.count >= REQUEST_MAX_PER_WINDOW) return socket.emit('song_error', 'Too many song requests — slow down.');
-      rec.count += 1;
-      socketRequestSongCounts.set(socket.id, rec);
-
-      if (!rooms[roomCode]) {
-        rooms[roomCode] = {
-          currentSongUrl: null,
-          currentTitle: 'No Song Playing',
-          currentThumbnail: null,
-          queue: [],
-          users: [],
-          isPlaying: false,
-          timestamp: 0,
-          lastUpdate: Date.now()
-        };
-      }
-
+      if (id) await getInfoWithCache(id); // This checks availability
+      
+      if (!rooms[roomCode]) return;
       const room = rooms[roomCode];
-      room.queue.push({ title: title || 'Unknown', thumbnail: thumbnail || null, originalUrl: youtubeUrl, audioUrl: null });
+      room.queue.push({ title, thumbnail, originalUrl: youtubeUrl });
       io.to(roomCode).emit('queue_updated', room.queue);
 
       if (!room.isPlaying) {
-        const playNext = makePlayNext(roomCode);
-        await playNext();
+        playNext(roomCode);
       }
-
     } catch (e) {
-      console.error('request_song error', e && e.message ? e.message : e);
-      socket.emit('song_error', 'Server error while adding song.');
+      socket.emit('song_error', 'Could not add song: ' + e.message);
     }
   });
 
-  socket.on('skip_track', (roomCode) => {
-    const playNext = makePlayNext(roomCode);
-    playNext();
-  });
+  socket.on('skip_track', (roomCode) => playNext(roomCode));
 
   socket.on('pause_track', ({ roomCode, timestamp }) => {
     if (rooms[roomCode]) {
@@ -519,8 +376,27 @@ io.on('connection', (socket) => {
       io.to(roomCode).emit('receive_seek', timestamp);
     }
   });
+});
 
-}); // io.on connection
+function playNext(roomCode) {
+  const room = rooms[roomCode];
+  if (!room || room.queue.length === 0) {
+    if (room) room.isPlaying = false;
+    return;
+  }
+  const next = room.queue.shift();
+  const proxyUrl = `/stream?url=${encodeURIComponent(next.originalUrl)}`;
+  
+  room.currentSongUrl = proxyUrl;
+  room.currentTitle = next.title;
+  room.currentThumbnail = next.thumbnail;
+  room.isPlaying = true;
+  room.timestamp = 0;
+  room.lastUpdate = Date.now();
 
-// ------------------ Start server ------------------
-server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT} (Piped instance: ${PIPED_INSTANCE})`));
+  io.to(roomCode).emit('play_song', { url: proxyUrl, title: next.title, thumbnail: next.thumbnail });
+  io.to(roomCode).emit('queue_updated', room.queue);
+}
+
+const PORT = process.env.PORT || 3001;
+server.listen(PORT, () => console.log(`🚀 Server running on ${PORT}`));
