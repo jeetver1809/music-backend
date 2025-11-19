@@ -3,7 +3,19 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const ytdl = require('ytdl-core');
-const ytsr = require('ytsr');
+const { Innertube } = require('youtubei.js');
+
+let ytClientPromise = null;
+function getYouTubeClient() {
+  if (!ytClientPromise) {
+    ytClientPromise = Innertube.create({ ignore_region: true }).catch(err => {
+      console.error('❌ Failed to init YouTube client:', err);
+      ytClientPromise = null;
+      throw err;
+    });
+  }
+  return ytClientPromise;
+}
 
 const app = express();
 app.use(cors());
@@ -237,14 +249,20 @@ io.on('connection', (socket) => {
       }
 
       console.log(`🔎 Searching: "${query}"`);
-      const search = await ytsr(query, { limit: 10 });
-      const entries = search.items.filter(item => item.type === 'video').slice(0, 5);
+      const yt = await getYouTubeClient();
+      const search = await yt.search(query, { type: 'video' });
+
+      const items = Array.isArray(search.results) ? search.results : [];
+      const entries = items
+        .filter(item => item.type === 'Video')
+        .slice(0, 5);
+
       if (entries.length > 0) {
         const results = entries.map(item => ({
-          title: item.title || 'Unknown',
+          title: item.title?.toString?.() || 'Unknown',
           id: item.id,
-          url: item.url || `https://www.youtube.com/watch?v=${item.id}`,
-          thumbnail: (item.bestThumbnail && item.bestThumbnail.url) ? item.bestThumbnail.url : `https://i.ytimg.com/vi/${item.id}/hqdefault.jpg`
+          url: `https://www.youtube.com/watch?v=${item.id}`,
+          thumbnail: item.thumbnails?.[0]?.url || `https://i.ytimg.com/vi/${item.id}/hqdefault.jpg`
         }));
         console.log(`✅ Found ${results.length} results`);
         socket.emit('search_results', results);
@@ -253,8 +271,8 @@ io.on('connection', (socket) => {
         socket.emit('search_results', []);
       }
     } catch (err) {
-      console.error('❌ search_query error:', err.message);
-      socket.emit('song_error', `Search failed: ${err.message}`);
+      console.error('❌ search_query error:', err);
+      socket.emit('song_error', `Search failed: ${err.message || 'Unknown error'}`);
     }
   });
 
