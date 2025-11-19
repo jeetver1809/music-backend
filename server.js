@@ -1,4 +1,4 @@
-// server.js (full file)
+// server.js (drop-in ready)
 // Music Jam server with caching, rate-limiting, Range-aware streaming, and validated queueing.
 
 const express = require('express');
@@ -100,7 +100,7 @@ const INFO_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const FORMAT_CACHE_TTL_MS = 30 * 1000;   // 30 seconds
 
 const infoCache = new Map();   // videoId -> { info, expiresAt }
-const formatCache = new Map(); // videoId -> { url, mimeType, expiresAt }
+const formatCache = new Map(); // videoId/url -> { url, mimeType, expiresAt }
 const inflightFetches = new Map(); // videoId -> Promise
 
 // Cleanup caches periodically
@@ -144,6 +144,26 @@ async function getInfoWithCache(urlOrId) {
 
 // Find best usable audio/muxed format URL; cache short-lived format URLs
 async function getFormatWithCache(urlOrId) {
+  // QUICK PASSTHROUGH: if the provided urlOrId is a direct http(s) media URL
+  // that is NOT a YouTube link, return it directly (so mp3 tests work).
+  if (typeof urlOrId === 'string' && /^https?:\/\//i.test(urlOrId) &&
+      !/youtube\.com|youtu\.be|youtube-nocookie\.com/i.test(urlOrId)) {
+    // Guess mime type based on extension (optional)
+    const extMatch = urlOrId.match(/\.(mp3|m4a|mp4|webm|ogg)(?:\?|$)/i);
+    const mimeType = extMatch ? (
+      extMatch[1].toLowerCase() === 'mp3' ? 'audio/mpeg' :
+      extMatch[1].toLowerCase() === 'm4a' ? 'audio/mp4' :
+      extMatch[1].toLowerCase() === 'mp4' ? 'video/mp4' :
+      extMatch[1].toLowerCase() === 'webm' ? 'audio/webm' :
+      extMatch[1].toLowerCase() === 'ogg' ? 'audio/ogg' :
+      'application/octet-stream'
+    ) : 'application/octet-stream';
+
+    const key = urlOrId; // use entire URL as cache key for non-YT
+    formatCache.set(key, { url: urlOrId, mimeType, expiresAt: Date.now() + FORMAT_CACHE_TTL_MS });
+    return { url: urlOrId, mimeType };
+  }
+
   const id = extractVideoId(urlOrId) || urlOrId;
   if (!id) throw new Error('Invalid video id/url');
 
@@ -466,7 +486,20 @@ io.on('connection', (socket) => {
     try {
       // 1) Validate availability via getInfoWithCache (throws if unavailable)
       try {
-        await getInfoWithCache(youtubeUrl);
+        // For non-YT URLs, getInfoWithCache will throw; so we only run getInfoWithCache for YT links.
+        // Use extractVideoId to decide.
+        const id = extractVideoId(youtubeUrl);
+        if (id) {
+          await getInfoWithCache(id);
+        } else {
+          // Non-YT URL — try a HEAD to ensure it's reachable
+          try {
+            await axios.head(youtubeUrl, { timeout: 8000 });
+          } catch (e) {
+            console.warn('request_song: non-YT URL HEAD failed', youtubeUrl, e && e.message ? e.message : e);
+            return socket.emit('song_error', `Cannot add "${title || 'this file'}": unreachable or unsupported.`);
+          }
+        }
       } catch (infoErr) {
         console.warn('request_song: getInfo failed for', youtubeUrl, infoErr && infoErr.message ? infoErr.message : infoErr);
         return socket.emit('song_error', `Cannot add "${title || 'this video'}": ${infoErr.message || 'unavailable'}`);
